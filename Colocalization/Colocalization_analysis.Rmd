@@ -1,0 +1,2501 @@
+---
+title: "Colocalization and LD-overlap analyses of plasma metabolites and sleep traits"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+This document integrates all numbered scripts in the former **Colocalization** folder in execution order: abf colocalization, nearest-gene annotation, SuSiE colocalization with a local LD panel, LD-based instrument-overlap clustering, and multi-trait HyPrColoc. Replace `"Path"` once in the setup chunk. Inputs are read through the shared `Data` structure, and all outputs are written to `Colocalization/outputs` without run-date suffixes.
+
+## Integrated setup and relative paths
+
+```{r coloc-00-setup, include=FALSE}
+# Source file: integrated setup from all Colocalization files
+# Integrated setup shared by every chunk.
+project_root <- normalizePath("Path", winslash = "/", mustWork = FALSE)
+
+data_dir               <- file.path(project_root, "Data")
+metabolite_gwas_dir    <- file.path(data_dir, "Metabolite_GWAS")
+sleep_gwas_dir         <- file.path(data_dir, "Sleep_GWAS")
+reference_dir          <- file.path(data_dir, "Reference")
+ld_bfile               <- file.path(data_dir, "LD_Reference", "EUR")
+
+code_dir               <- file.path(project_root, "MetaboliteSleep_Code")
+mr_code_dir            <- file.path(code_dir, "MR")
+coloc_code_dir         <- file.path(code_dir, "Colocalization")
+mr_output_dir          <- file.path(mr_code_dir, "outputs")
+coloc_output_dir       <- file.path(coloc_code_dir, "outputs")
+
+dir.create(coloc_output_dir, recursive = TRUE, showWarnings = FALSE)
+
+catalog_file            <- file.path(reference_dir, "gwas_catalog_summary_statistics_table_export.tsv")
+sleep_trait_file        <- file.path(reference_dir, "GWAS_sleep_trait.xlsx")
+pathway_file            <- file.path(reference_dir, "20231120_metabolite_pathway.xlsx")
+significant_mr_file      <- file.path(mr_output_dir, "metabolite_sleep_primary_fdrmethod0.05.xlsx")
+lipid_iv_file           <- file.path(reference_dir, "Ivs_LipidSleepDur.xlsx")
+
+suppressPackageStartupMessages({
+  library(MendelianRandomization)
+  library(dplyr)
+  library(data.table)
+  library(readxl)
+  library(openxlsx)
+  library(TwoSampleMR)
+  library(plinkbinr)
+  library(ieugwasr)
+  library(ggplot2)
+  library(mr.raps)
+  library(coloc)
+  library(stringr)
+  library(susieR)
+  library(vautils)
+  library(pheatmap)
+  library(hyprcoloc)
+  library(cluster)
+})
+```
+
+## 1. Approximate Bayes factor colocalization in ±500 kb windows
+
+Each sleep-trait chunk harmonizes the metabolite and sleep summary statistics, restricts the region to ±500 kb around the metabolite lead SNP, and runs `coloc.abf`.
+
+**Analysis block.** Select metabolites for colocalization.
+
+```{r coloc-01-01-select-colocalization-metabolites}
+# Source file: 1_colocalization_abf_500kb.Rmd
+all_res<-read_excel(significant_mr_file, sheet = "Sheet 1")
+
+# Select metabolite levels only (exclude ratio variables)
+all_res<-subset(all_res,gene_shared_protein == "NA")
+```
+
+**Analysis block.** Configure shared paths.
+
+```{r coloc-01-02-configure-paths}
+# Source file: 1_colocalization_abf_500kb.Rmd
+dat_dir <- metabolite_gwas_dir
+file_dir <- coloc_output_dir
+```
+
+**Analysis block.** Obtain metabolite sample sizes from GWAS Catalog.
+
+```{r coloc-01-03-catalog-sample-size}
+# Source file: 1_colocalization_abf_500kb.Rmd
+catalog<-fread(catalog_file)
+
+catalog<-subset(catalog,catalog$firstAuthor=="Chen Y")
+catalog<-subset(catalog,catalog$pubmedId=="36635386")
+
+catalog$Ancestry<- sapply(catalog$discoverySampleAncestry,function(x){
+        temp <- strsplit(x, split = " ")[[1]][2]
+				return(as.character(temp))	
+				})
+catalog<-subset(catalog,catalog$Ancestry=="European")
+
+catalog$exposure<- sapply(catalog$accessionId,function(x){
+        temp <- strsplit(x, split = "T")[[1]][2]
+				return(as.character(temp))	
+				})
+
+catalog$N<- sapply(catalog$discoverySampleAncestry,function(x){
+        temp <- strsplit(x, split = " ")[[1]][1]
+				return(as.numeric(temp))	
+				})
+catalog<-catalog[,c("exposure","N")]
+```
+
+**Analysis block.** Long sleep duration.
+
+```{r coloc-01-04-long-sleep-duration}
+# Source file: 1_colocalization_abf_500kb.Rmd
+load(file.path(sleep_gwas_dir, "30846698", "long_sleep_duration_unadjBMI_UKB_2019_allSNP_hg38.RData"))
+longsleepduration <- get("dat_allSNP_hg38")
+rm(dat_allSNP_hg38)
+
+# Initialize the colocalization summary table
+coloc_res<-data.frame(metabolite=NA,sleep=NA,nsnps=NA,PPH0=NA,PPH1=NA,PPH2=NA,PPH3=NA,PPH4=NA,snp=NA,position=NA,V.df1=NA,z.df1=NA,r.df1=NA,lABF.df1=NA,V.df2=NA,z.df2=NA,r.df2=NA,lABF.df2=NA,internal.sum.lABF=NA,SNP.PP.H4=NA)
+
+for (sleepty in c("longsleepduration")) {
+  
+  # Select metabolites significant for this sleep trait
+  signif_res<-subset(all_res,all_res$outcome==sleepty)
+  
+  id<-unique(signif_res$exposure)
+  
+  longsleepduration<- longsleepduration[order(longsleepduration$P,decreasing = FALSE),]
+  longsleepduration<- longsleepduration[!duplicated(longsleepduration$SNP),]
+  
+  for (metaboliteid in id) {
+    metabolite<-fread(paste(dat_dir,"GCST",metaboliteid,".tsv.gz",sep = ""))
+    
+    metabolite<- metabolite[order(metabolite$p_value,decreasing = FALSE),]
+    metabolite<- metabolite[!duplicated(metabolite$variant_id),]
+    
+    setnames(metabolite,"variant_id","SNP")
+    
+    metabolite_N<-catalog[catalog$exposure==metaboliteid,][[2]]
+    
+    load(paste(file.path(mr_output_dir, "harmonise_data"), "/", metaboliteid, "_longsleepduration_har3.RData", sep = ""))
+    top_chr<- exp_out_har3[order(exp_out_har3$pval.exposure,
+                                 decreasing = FALSE),][1,]$chr.exposure
+    top_bp<- exp_out_har3[order(exp_out_har3$pval.exposure,
+                                 decreasing = FALSE),][1,]$pos.exposure
+    
+    metabolite<-subset(metabolite,base_pair_location>top_bp-500000 & base_pair_location<top_bp+500000 & chromosome==top_chr)
+    sleept<-subset(longsleepduration,BP>top_bp-500000 & BP<top_bp+500000 & CHR==top_chr)
+    
+    input <- merge(sleept, metabolite, by="SNP", 
+                     all=FALSE, suffixes=c(".sl",".mt"))
+    
+    metabolite_format<-format_data(input,type = "exposure",snps = NULL,header = TRUE,snp_col = "SNP",chr_col = "chromosome",pos_col = "base_pair_location",effect_allele_col = "effect_allele",other_allele_col = "other_allele",eaf_col = "effect_allele_frequency",beta_col = "beta",se_col = "standard_error",pval_col = "p_value")
+    sleep_format<-format_data(input,type = "outcome",snps = input$SNP,header = TRUE,snp_col = "SNP",chr_col = "CHR",pos_col = "BP",effect_allele_col = "Effect_Allele",other_allele_col = "Other_Allele",eaf_col = "EAF",beta_col = "BETA",se_col = "BETA_SE",pval_col = "P")
+    har<-harmonise_data(metabolite_format,sleep_format,action = 2)
+    har<-subset(har,har$mr_keep==TRUE)
+    har$MAF<-ifelse(har$eaf.exposure<0.5,har$eaf.exposure,1-har$eaf.exposure)
+
+    result <- coloc.abf(dataset1=list(snp=har$SNP,beta=har$beta.outcome,
+                                      varbeta=(har$se.outcome)^2,position=har$pos.outcome, 
+                                      type="cc"), 
+                        dataset2=list(snp=har$SNP,beta=har$beta.exposure,
+                                      varbeta=(har$se.exposure)^2,position=har$pos.exposure,
+                                      type="quant",N=metabolite_N,MAF=har$MAF))
+  
+    need_result=(result$results %>% dplyr::arrange(desc(SNP.PP.H4)))[1,]
+    
+    #record results
+    need_result$metabolite<-metaboliteid
+    need_result$sleep<-sleepty
+    need_result$nsnps<-result[["summary"]][["nsnps"]]
+    need_result$PPH0<-result[["summary"]][["PP.H0.abf"]]
+    need_result$PPH1<-result[["summary"]][["PP.H1.abf"]]
+    need_result$PPH2<-result[["summary"]][["PP.H2.abf"]]
+    need_result$PPH3<-result[["summary"]][["PP.H3.abf"]]
+    need_result$PPH4<-result[["summary"]][["PP.H4.abf"]]
+    
+    coloc_res<-rbind(coloc_res,need_result)
+    rm(metabolite)
+    rm(input)
+  }
+}
+
+coloc_res<-coloc_res[-1,]
+
+write.csv(coloc_res,file = file.path(file_dir, "metabolite_longsleepduration_colocalization_500kb_res.csv"))
+
+rm(longsleepduration)
+```
+
+**Analysis block.** Short sleep duration.
+
+```{r coloc-01-05-short-sleep-duration}
+# Source file: 1_colocalization_abf_500kb.Rmd
+load(file.path(sleep_gwas_dir, "30846698", "short_sleep_duration_unadjBMI_UKB_2019_allSNP_hg38.RData"))
+shortsleepduration <- get("dat_allSNP_hg38")
+rm(dat_allSNP_hg38)
+
+# Initialize the colocalization summary table
+coloc_res<-data.frame(metabolite=NA,sleep=NA,nsnps=NA,PPH0=NA,PPH1=NA,PPH2=NA,PPH3=NA,PPH4=NA,snp=NA,position=NA,V.df1=NA,z.df1=NA,r.df1=NA,lABF.df1=NA,V.df2=NA,z.df2=NA,r.df2=NA,lABF.df2=NA,internal.sum.lABF=NA,SNP.PP.H4=NA)
+
+for (sleepty in c("shortsleepduration")) {
+  
+  # Select metabolites significant for this sleep trait
+  signif_res<-subset(all_res,all_res$outcome==sleepty)
+  
+  id<-unique(signif_res$exposure)
+  
+  shortsleepduration<- shortsleepduration[order(shortsleepduration$P,decreasing = FALSE),]
+  shortsleepduration<- shortsleepduration[!duplicated(shortsleepduration$SNP),]
+  
+  for (metaboliteid in id) {
+    metabolite<-fread(paste(dat_dir,"GCST",metaboliteid,".tsv.gz",sep = ""))
+    
+    metabolite<- metabolite[order(metabolite$p_value,decreasing = FALSE),]
+    metabolite<- metabolite[!duplicated(metabolite$variant_id),]
+    
+    setnames(metabolite,"variant_id","SNP")
+    
+    metabolite_N<-catalog[catalog$exposure==metaboliteid,][[2]]
+    
+    load(paste(file.path(mr_output_dir, "harmonise_data"), "/", metaboliteid, "_shortsleepduration_har3.RData", sep = ""))
+    top_chr<- exp_out_har3[order(exp_out_har3$pval.exposure,
+                                 decreasing = FALSE),][1,]$chr.exposure
+    top_bp<- exp_out_har3[order(exp_out_har3$pval.exposure,
+                                 decreasing = FALSE),][1,]$pos.exposure
+    
+    metabolite<-subset(metabolite,base_pair_location>top_bp-500000 & base_pair_location<top_bp+500000 & chromosome==top_chr)
+    sleept<-subset(shortsleepduration,BP>top_bp-500000 & BP<top_bp+500000 & CHR==top_chr)
+    
+    input <- merge(sleept, metabolite, by="SNP", 
+                     all=FALSE, suffixes=c(".sl",".mt"))
+    
+    metabolite_format<-format_data(input,type = "exposure",snps = NULL,header = TRUE,snp_col = "SNP",chr_col = "chromosome",pos_col = "base_pair_location",effect_allele_col = "effect_allele",other_allele_col = "other_allele",eaf_col = "effect_allele_frequency",beta_col = "beta",se_col = "standard_error",pval_col = "p_value")
+    sleep_format<-format_data(input,type = "outcome",snps = input$SNP,header = TRUE,snp_col = "SNP",chr_col = "CHR",pos_col = "BP",effect_allele_col = "Effect_Allele",other_allele_col = "Other_Allele",eaf_col = "EAF",beta_col = "BETA",se_col = "BETA_SE",pval_col = "P")
+    har<-harmonise_data(metabolite_format,sleep_format,action = 2)
+    har<-subset(har,har$mr_keep==TRUE)
+    har$MAF<-ifelse(har$eaf.exposure<0.5,har$eaf.exposure,1-har$eaf.exposure)
+
+    result <- coloc.abf(dataset1=list(snp=har$SNP,beta=har$beta.outcome,
+                                      varbeta=(har$se.outcome)^2,position=har$pos.outcome, 
+                                      type="cc"), 
+                        dataset2=list(snp=har$SNP,beta=har$beta.exposure,
+                                      varbeta=(har$se.exposure)^2,position=har$pos.exposure,
+                                      type="quant",N=metabolite_N,MAF=har$MAF))
+  
+    need_result=(result$results %>% dplyr::arrange(desc(SNP.PP.H4)))[1,]
+    
+    #record results
+    need_result$metabolite<-metaboliteid
+    need_result$sleep<-sleepty
+    need_result$nsnps<-result[["summary"]][["nsnps"]]
+    need_result$PPH0<-result[["summary"]][["PP.H0.abf"]]
+    need_result$PPH1<-result[["summary"]][["PP.H1.abf"]]
+    need_result$PPH2<-result[["summary"]][["PP.H2.abf"]]
+    need_result$PPH3<-result[["summary"]][["PP.H3.abf"]]
+    need_result$PPH4<-result[["summary"]][["PP.H4.abf"]]
+  
+    coloc_res<-rbind(coloc_res,need_result)
+    rm(metabolite)
+    rm(input)
+  }
+}
+
+coloc_res<-coloc_res[-1,]
+
+write.csv(coloc_res,file = file.path(file_dir, "metabolite_shortsleepduration_colocalization_500kb_res.csv"))
+
+rm(shortsleepduration)
+```
+
+**Analysis block.** Insomnia.
+
+```{r coloc-01-06-insomnia}
+# Source file: 1_colocalization_abf_500kb.Rmd
+load(file.path(sleep_gwas_dir, "30804566", "insomnia_unadjBMI_UKB_2019_allSNP_hg38.RData"))
+insomnia <- get("dat_allSNP_hg38")
+rm(dat_allSNP_hg38)
+
+# Initialize the colocalization summary table
+coloc_res<-data.frame(metabolite=NA,sleep=NA,nsnps=NA,PPH0=NA,PPH1=NA,PPH2=NA,PPH3=NA,PPH4=NA,snp=NA,position=NA,V.df1=NA,z.df1=NA,r.df1=NA,lABF.df1=NA,V.df2=NA,z.df2=NA,r.df2=NA,lABF.df2=NA,internal.sum.lABF=NA,SNP.PP.H4=NA)
+
+for (sleepty in c("insomnia")) {
+  
+  # Select metabolites significant for this sleep trait
+  signif_res<-subset(all_res,all_res$outcome==sleepty)
+  
+  id<-unique(signif_res$exposure)
+  
+  insomnia<- insomnia[order(insomnia$P,decreasing = FALSE),]
+  insomnia<- insomnia[!duplicated(insomnia$SNP),]
+  
+  for (metaboliteid in id) {
+    metabolite<-fread(paste(dat_dir,"GCST",metaboliteid,".tsv.gz",sep = ""))
+    
+    metabolite<- metabolite[order(metabolite$p_value,decreasing = FALSE),]
+    metabolite<- metabolite[!duplicated(metabolite$variant_id),]
+    
+    setnames(metabolite,"variant_id","SNP")
+    
+    metabolite_N<-catalog[catalog$exposure==metaboliteid,][[2]]
+    
+    load(paste(file.path(mr_output_dir, "harmonise_data"), "/", metaboliteid, "_insomnia_har3.RData", sep = ""))
+    top_chr<- exp_out_har3[order(exp_out_har3$pval.exposure,
+                                 decreasing = FALSE),][1,]$chr.exposure
+    top_bp<- exp_out_har3[order(exp_out_har3$pval.exposure,
+                                 decreasing = FALSE),][1,]$pos.exposure
+    
+    metabolite<-subset(metabolite,base_pair_location>top_bp-500000 & base_pair_location<top_bp+500000 & chromosome==top_chr)
+    sleept<-subset(insomnia,BP>top_bp-500000 & BP<top_bp+500000 & CHR==top_chr)
+    
+    input <- merge(sleept, metabolite, by="SNP", 
+                     all=FALSE, suffixes=c(".sl",".mt"))
+    
+    metabolite_format<-format_data(input,type = "exposure",snps = NULL,header = TRUE,snp_col = "SNP",chr_col = "chromosome",pos_col = "base_pair_location",effect_allele_col = "effect_allele",other_allele_col = "other_allele",eaf_col = "effect_allele_frequency",beta_col = "beta",se_col = "standard_error",pval_col = "p_value")
+    sleep_format<-format_data(input,type = "outcome",snps = input$SNP,header = TRUE,snp_col = "SNP",chr_col = "CHR",pos_col = "BP",effect_allele_col = "Effect_Allele",other_allele_col = "Other_Allele",eaf_col = "EAF",beta_col = "BETA",se_col = "BETA_SE",pval_col = "P")
+    har<-harmonise_data(metabolite_format,sleep_format,action = 2)
+    har<-subset(har,har$mr_keep==TRUE)
+    har$MAF<-ifelse(har$eaf.exposure<0.5,har$eaf.exposure,1-har$eaf.exposure)
+
+    result <- coloc.abf(dataset1=list(snp=har$SNP,beta=har$beta.outcome,
+                                      varbeta=(har$se.outcome)^2,position=har$pos.outcome, 
+                                      type="cc"), 
+                        dataset2=list(snp=har$SNP,beta=har$beta.exposure,
+                                      varbeta=(har$se.exposure)^2,position=har$pos.exposure,
+                                      type="quant",N=metabolite_N,MAF=har$MAF))
+  
+    need_result=(result$results %>% dplyr::arrange(desc(SNP.PP.H4)))[1,]
+    
+    #record results
+    need_result$metabolite<-metaboliteid
+    need_result$sleep<-sleepty
+    need_result$nsnps<-result[["summary"]][["nsnps"]]
+    need_result$PPH0<-result[["summary"]][["PP.H0.abf"]]
+    need_result$PPH1<-result[["summary"]][["PP.H1.abf"]]
+    need_result$PPH2<-result[["summary"]][["PP.H2.abf"]]
+    need_result$PPH3<-result[["summary"]][["PP.H3.abf"]]
+    need_result$PPH4<-result[["summary"]][["PP.H4.abf"]]
+  
+    coloc_res<-rbind(coloc_res,need_result)
+    rm(metabolite)
+    rm(input)
+  }
+}
+
+coloc_res<-coloc_res[-1,]
+
+write.csv(coloc_res,file = file.path(file_dir, "metabolite_insomnia_colocalization_500kb_res.csv"))
+
+rm(insomnia)
+```
+
+**Analysis block.** Morning person.
+
+```{r coloc-01-07-morning-person}
+# Source file: 1_colocalization_abf_500kb.Rmd
+load(file.path(sleep_gwas_dir, "30696823", "morning_person_unadjBMI_UKB_2019_allSNP_hg38.RData"))
+morning_person <- get("dat_allSNP_hg38")
+rm(dat_allSNP_hg38)
+
+# Initialize the colocalization summary table
+coloc_res<-data.frame(metabolite=NA,sleep=NA,nsnps=NA,PPH0=NA,PPH1=NA,PPH2=NA,PPH3=NA,PPH4=NA,snp=NA,position=NA,V.df1=NA,z.df1=NA,r.df1=NA,lABF.df1=NA,V.df2=NA,z.df2=NA,r.df2=NA,lABF.df2=NA,internal.sum.lABF=NA,SNP.PP.H4=NA)
+
+for (sleepty in c("morning_person")) {
+  
+  # Select metabolites significant for this sleep trait
+  signif_res<-subset(all_res,all_res$outcome==sleepty)
+  
+  id<-unique(signif_res$exposure)
+  
+  morning_person<- morning_person[order(morning_person$P,decreasing = FALSE),]
+  morning_person<- morning_person[!duplicated(morning_person$SNP),]
+  
+  for (metaboliteid in id) {
+    metabolite<-fread(paste(dat_dir,"GCST",metaboliteid,".tsv.gz",sep = ""))
+    
+    metabolite<- metabolite[order(metabolite$p_value,decreasing = FALSE),]
+    metabolite<- metabolite[!duplicated(metabolite$variant_id),]
+    
+    setnames(metabolite,"variant_id","SNP")
+    
+    metabolite_N<-catalog[catalog$exposure==metaboliteid,][[2]]
+    
+    load(paste(file.path(mr_output_dir, "harmonise_data"), "/", metaboliteid, "_morning_person_har3.RData", sep = ""))
+    top_chr<- exp_out_har3[order(exp_out_har3$pval.exposure,
+                                 decreasing = FALSE),][1,]$chr.exposure
+    top_bp<- exp_out_har3[order(exp_out_har3$pval.exposure,
+                                 decreasing = FALSE),][1,]$pos.exposure
+    
+    metabolite<-subset(metabolite,base_pair_location>top_bp-500000 & base_pair_location<top_bp+500000 & chromosome==top_chr)
+    sleept<-subset(morning_person,BP>top_bp-500000 & BP<top_bp+500000 & CHR==top_chr)
+    
+    input <- merge(sleept, metabolite, by="SNP", 
+                     all=FALSE, suffixes=c(".sl",".mt"))
+    
+    metabolite_format<-format_data(input,type = "exposure",snps = NULL,header = TRUE,snp_col = "SNP",chr_col = "chromosome",pos_col = "base_pair_location",effect_allele_col = "effect_allele",other_allele_col = "other_allele",eaf_col = "effect_allele_frequency",beta_col = "beta",se_col = "standard_error",pval_col = "p_value")
+    sleep_format<-format_data(input,type = "outcome",snps = input$SNP,header = TRUE,snp_col = "SNP",chr_col = "CHR",pos_col = "BP",effect_allele_col = "Effect_Allele",other_allele_col = "Other_Allele",eaf_col = "EAF",beta_col = "BETA",se_col = "BETA_SE",pval_col = "P")
+    har<-harmonise_data(metabolite_format,sleep_format,action = 2)
+    har<-subset(har,har$mr_keep==TRUE)
+    har$MAF<-ifelse(har$eaf.exposure<0.5,har$eaf.exposure,1-har$eaf.exposure)
+
+    result <- coloc.abf(dataset1=list(snp=har$SNP,beta=har$beta.outcome,
+                                      varbeta=(har$se.outcome)^2,position=har$pos.outcome, 
+                                      type="cc"), 
+                        dataset2=list(snp=har$SNP,beta=har$beta.exposure,
+                                      varbeta=(har$se.exposure)^2,position=har$pos.exposure,
+                                      type="quant",N=metabolite_N,MAF=har$MAF))
+  
+    need_result=(result$results %>% dplyr::arrange(desc(SNP.PP.H4)))[1,]
+    
+    #record results
+    need_result$metabolite<-metaboliteid
+    need_result$sleep<-sleepty
+    need_result$nsnps<-result[["summary"]][["nsnps"]]
+    need_result$PPH0<-result[["summary"]][["PP.H0.abf"]]
+    need_result$PPH1<-result[["summary"]][["PP.H1.abf"]]
+    need_result$PPH2<-result[["summary"]][["PP.H2.abf"]]
+    need_result$PPH3<-result[["summary"]][["PP.H3.abf"]]
+    need_result$PPH4<-result[["summary"]][["PP.H4.abf"]]
+  
+    coloc_res<-rbind(coloc_res,need_result)
+    rm(metabolite)
+    rm(input)
+  }
+}
+
+coloc_res<-coloc_res[-1,]
+
+write.csv(coloc_res,file = file.path(file_dir, "metabolite_morning_person_colocalization_500kb_res.csv"))
+
+rm(morning_person)
+```
+
+**Analysis block.** Snoring adjusted for BMI.
+
+```{r coloc-01-08-snoring-adj-bmi}
+# Source file: 1_colocalization_abf_500kb.Rmd
+load(file.path(sleep_gwas_dir, "32060260", "snoring_adjBMI_UKB_2018_allSNP_hg38.RData"))
+snoring_adjBMI <- get("dat_allSNP_hg38")
+rm(dat_allSNP_hg38)
+
+# Initialize the colocalization summary table
+coloc_res<-data.frame(metabolite=NA,sleep=NA,nsnps=NA,PPH0=NA,PPH1=NA,PPH2=NA,PPH3=NA,PPH4=NA,snp=NA,position=NA,V.df1=NA,z.df1=NA,r.df1=NA,lABF.df1=NA,V.df2=NA,z.df2=NA,r.df2=NA,lABF.df2=NA,internal.sum.lABF=NA,SNP.PP.H4=NA)
+
+for (sleepty in c("snoring_adjBMI")) {
+  
+  # Select metabolites significant for this sleep trait
+  signif_res<-subset(all_res,all_res$outcome=="snoringadjBMI")
+  
+  id<-unique(signif_res$exposure)
+  
+  snoring_adjBMI<- snoring_adjBMI[order(snoring_adjBMI$P,decreasing = FALSE),]
+  snoring_adjBMI<- snoring_adjBMI[!duplicated(snoring_adjBMI$SNP),]
+  
+  for (metaboliteid in id) {
+    metabolite<-fread(paste(dat_dir,"GCST",metaboliteid,".tsv.gz",sep = ""))
+    
+    metabolite<- metabolite[order(metabolite$p_value,decreasing = FALSE),]
+    metabolite<- metabolite[!duplicated(metabolite$variant_id),]
+    
+    setnames(metabolite,"variant_id","SNP")
+    
+    metabolite_N<-catalog[catalog$exposure==metaboliteid,][[2]]
+    
+    load(paste(file.path(mr_output_dir, "harmonise_data"), "/", metaboliteid, "_snoringadjBMI_har3.RData", sep = ""))
+    top_chr<- exp_out_har3[order(exp_out_har3$pval.exposure,
+                                 decreasing = FALSE),][1,]$chr.exposure
+    top_bp<- exp_out_har3[order(exp_out_har3$pval.exposure,
+                                 decreasing = FALSE),][1,]$pos.exposure
+    
+    metabolite<-subset(metabolite,base_pair_location>top_bp-500000 & base_pair_location<top_bp+500000 & chromosome==top_chr)
+    sleept<-subset(snoring_adjBMI,BP>top_bp-500000 & BP<top_bp+500000 & CHR==top_chr)
+    
+    input <- merge(sleept, metabolite, by="SNP", 
+                     all=FALSE, suffixes=c(".sl",".mt"))
+    
+    metabolite_format<-format_data(input,type = "exposure",snps = NULL,header = TRUE,snp_col = "SNP",chr_col = "chromosome",pos_col = "base_pair_location",effect_allele_col = "effect_allele",other_allele_col = "other_allele",eaf_col = "effect_allele_frequency",beta_col = "beta",se_col = "standard_error",pval_col = "p_value")
+    sleep_format<-format_data(input,type = "outcome",snps = input$SNP,header = TRUE,snp_col = "SNP",chr_col = "CHR",pos_col = "BP",effect_allele_col = "Effect_Allele",other_allele_col = "Other_Allele",eaf_col = "EAF",beta_col = "BETA",se_col = "BETA_SE",pval_col = "P")
+    har<-harmonise_data(metabolite_format,sleep_format,action = 2)
+    har<-subset(har,har$mr_keep==TRUE)
+    har$MAF<-ifelse(har$eaf.exposure<0.5,har$eaf.exposure,1-har$eaf.exposure)
+
+    result <- coloc.abf(dataset1=list(snp=har$SNP,beta=har$beta.outcome,
+                                      varbeta=(har$se.outcome)^2,position=har$pos.outcome, 
+                                      type="cc"), 
+                        dataset2=list(snp=har$SNP,beta=har$beta.exposure,
+                                      varbeta=(har$se.exposure)^2,position=har$pos.exposure,
+                                      type="quant",N=metabolite_N,MAF=har$MAF))
+  
+    need_result=(result$results %>% dplyr::arrange(desc(SNP.PP.H4)))[1,]
+    
+    #record results
+    need_result$metabolite<-metaboliteid
+    need_result$sleep<-sleepty
+    need_result$nsnps<-result[["summary"]][["nsnps"]]
+    need_result$PPH0<-result[["summary"]][["PP.H0.abf"]]
+    need_result$PPH1<-result[["summary"]][["PP.H1.abf"]]
+    need_result$PPH2<-result[["summary"]][["PP.H2.abf"]]
+    need_result$PPH3<-result[["summary"]][["PP.H3.abf"]]
+    need_result$PPH4<-result[["summary"]][["PP.H4.abf"]]
+  
+    coloc_res<-rbind(coloc_res,need_result)
+    rm(metabolite)
+    rm(input)
+  }
+}
+
+coloc_res<-coloc_res[-1,]
+
+write.csv(coloc_res,file = file.path(file_dir, "metabolite_snoring_adjBMI_colocalization_500kb_res.csv"))
+
+rm(snoring_adjBMI)
+```
+
+**Analysis block.** Obstructive sleep apnoea.
+
+```{r coloc-01-09-osa}
+# Source file: 1_colocalization_abf_500kb.Rmd
+load(file.path(sleep_gwas_dir, "OSA", "OSA_R5_allSNP_hg38.RData"))
+OSA <- subset(OSA, OSA$EAF<1)
+
+# Initialize the colocalization summary table
+coloc_res<-data.frame(metabolite=NA,sleep=NA,nsnps=NA,PPH0=NA,PPH1=NA,PPH2=NA,PPH3=NA,PPH4=NA,snp=NA,position=NA,V.df1=NA,z.df1=NA,r.df1=NA,lABF.df1=NA,V.df2=NA,z.df2=NA,r.df2=NA,lABF.df2=NA,internal.sum.lABF=NA,SNP.PP.H4=NA)
+
+for (sleepty in c("OSA")) {
+  # Select metabolites significant for this sleep trait
+  signif_res<-subset(all_res,all_res$outcome==sleepty)
+  
+  id<-unique(signif_res$exposure)
+  
+  OSA<- OSA[order(OSA$P,decreasing = FALSE),]
+  OSA<- OSA[!duplicated(OSA$SNP),]
+  
+  for (metaboliteid in id) {
+    metabolite<-fread(paste(dat_dir,"GCST",metaboliteid,".tsv.gz",sep = ""))
+    
+    metabolite<- metabolite[order(metabolite$p_value,decreasing = FALSE),]
+    metabolite<- metabolite[!duplicated(metabolite$variant_id),]
+    
+    setnames(metabolite,"variant_id","SNP")
+    
+    metabolite_N<-catalog[catalog$exposure==metaboliteid,][[2]]
+    
+    load(paste(file.path(mr_output_dir, "harmonise_data"), "/", metaboliteid, "_OSA_har3.RData", sep = ""))
+    top_chr<- exp_out_har3[order(exp_out_har3$pval.exposure,
+                                 decreasing = FALSE),][1,]$chr.exposure
+    top_bp<- exp_out_har3[order(exp_out_har3$pval.exposure,
+                                 decreasing = FALSE),][1,]$pos.exposure
+    
+    metabolite<-subset(metabolite,base_pair_location>top_bp-500000 & base_pair_location<top_bp+500000 & chromosome==top_chr)
+    sleept<-subset(OSA,BP>top_bp-500000 & BP<top_bp+500000 & CHR==top_chr)
+    
+    input <- merge(sleept, metabolite, by="SNP", 
+                     all=FALSE, suffixes=c(".sl",".mt"))
+    
+    metabolite_format<-format_data(input,type = "exposure",snps = NULL,header = TRUE,snp_col = "SNP",chr_col = "chromosome",pos_col = "base_pair_location",effect_allele_col = "effect_allele",other_allele_col = "other_allele",eaf_col = "effect_allele_frequency",beta_col = "beta",se_col = "standard_error",pval_col = "p_value")
+    sleep_format<-format_data(input,type = "outcome",snps = input$SNP,header = TRUE,snp_col = "SNP",chr_col = "CHR",pos_col = "BP",effect_allele_col = "Effect_Allele",other_allele_col = "Other_Allele",eaf_col = "EAF",beta_col = "BETA",se_col = "BETA_SE",pval_col = "P")
+    har<-harmonise_data(metabolite_format,sleep_format,action = 2)
+    har<-subset(har,har$mr_keep==TRUE)
+    har$MAF<-ifelse(har$eaf.exposure<0.5,har$eaf.exposure,1-har$eaf.exposure)
+
+    result <- coloc.abf(dataset1=list(snp=har$SNP,beta=har$beta.outcome,
+                                      varbeta=(har$se.outcome)^2,position=har$pos.outcome, 
+                                      type="cc"), 
+                        dataset2=list(snp=har$SNP,beta=har$beta.exposure,
+                                      varbeta=(har$se.exposure)^2,position=har$pos.exposure,
+                                      type="quant",N=metabolite_N,MAF=har$MAF))
+  
+    need_result=(result$results %>% dplyr::arrange(desc(SNP.PP.H4)))[1,]
+    
+    #record results
+    need_result$metabolite<-metaboliteid
+    need_result$sleep<-sleepty
+    need_result$nsnps<-result[["summary"]][["nsnps"]]
+    need_result$PPH0<-result[["summary"]][["PP.H0.abf"]]
+    need_result$PPH1<-result[["summary"]][["PP.H1.abf"]]
+    need_result$PPH2<-result[["summary"]][["PP.H2.abf"]]
+    need_result$PPH3<-result[["summary"]][["PP.H3.abf"]]
+    need_result$PPH4<-result[["summary"]][["PP.H4.abf"]]
+  
+    coloc_res<-rbind(coloc_res,need_result)
+    rm(metabolite)
+    rm(input)
+  }
+}
+
+coloc_res<-coloc_res[-1,]
+
+write.csv(coloc_res,file = file.path(file_dir, "metabolite_OSA_colocalization_500kb_res.csv"))
+
+rm(OSA)
+```
+
+**Analysis block.** Daytime sleepiness adjusted for BMI.
+
+```{r coloc-01-10-daytime-sleepiness}
+# Source file: 1_colocalization_abf_500kb.Rmd
+load(file.path(sleep_gwas_dir, "31409809", "daytime_sleepiness_adjBMI_UKB_2019_allSNP_hg38.RData"))
+daytimesleepiness_adjBMI <- get("dat_allSNP_hg38")
+rm(dat_allSNP_hg38)
+
+# Initialize the colocalization summary table
+coloc_res<-data.frame(metabolite=NA,sleep=NA,nsnps=NA,PPH0=NA,PPH1=NA,PPH2=NA,PPH3=NA,PPH4=NA,snp=NA,position=NA,V.df1=NA,z.df1=NA,r.df1=NA,lABF.df1=NA,V.df2=NA,z.df2=NA,r.df2=NA,lABF.df2=NA,internal.sum.lABF=NA,SNP.PP.H4=NA)
+
+for (sleepty in c("daytimesleepiness_adjBMI")) {
+  # Select metabolites significant for this sleep trait
+  signif_res<-subset(all_res,all_res$outcome==sleepty)
+  
+  daytimesleepiness_adjBMI<- daytimesleepiness_adjBMI[order(daytimesleepiness_adjBMI$P,decreasing = FALSE),]
+  daytimesleepiness_adjBMI<- daytimesleepiness_adjBMI[!duplicated(daytimesleepiness_adjBMI$SNP),]
+  
+  for (metaboliteid in signif_res$exposure) {
+    metabolite<-fread(paste(dat_dir,"GCST",metaboliteid,".tsv.gz",sep = ""))
+    
+    metabolite<- metabolite[order(metabolite$p_value,decreasing = FALSE),]
+    metabolite<- metabolite[!duplicated(metabolite$variant_id),]
+  
+    setnames(metabolite,"variant_id","SNP")
+    
+    metabolite_N<-catalog[catalog$exposure==metaboliteid,][[2]]
+    
+    load(paste(file.path(mr_output_dir, "harmonise_data"), "/", metaboliteid, "_daytimesleepiness_adjBMI_har3.RData", sep = ""))
+    top_chr<- exp_out_har3[order(exp_out_har3$pval.exposure,
+                                 decreasing = FALSE),][1,]$chr.exposure
+    top_bp<- exp_out_har3[order(exp_out_har3$pval.exposure,
+                                 decreasing = FALSE),][1,]$pos.exposure
+    
+    metabolite<-subset(metabolite,base_pair_location>top_bp-500000 & base_pair_location<top_bp+500000 & chromosome==top_chr)
+    sleept<-subset(daytimesleepiness_adjBMI,BP>top_bp-500000 & BP<top_bp+500000 & CHR==top_chr)
+    
+    input <- merge(sleept, metabolite, by="SNP", 
+                     all=FALSE, suffixes=c(".sl",".mt"))
+    
+    metabolite_format<-format_data(input,type = "exposure",snps = NULL,header = TRUE,snp_col = "SNP",chr_col = "chromosome",pos_col = "base_pair_location",effect_allele_col = "effect_allele",other_allele_col = "other_allele",eaf_col = "effect_allele_frequency",beta_col = "beta",se_col = "standard_error",pval_col = "p_value")
+    sleep_format<-format_data(input,type = "outcome",snps = input$SNP,header = TRUE,snp_col = "SNP",chr_col = "CHR",pos_col = "BP",effect_allele_col = "Effect_Allele",other_allele_col = "Other_Allele",eaf_col = "EAF",beta_col = "BETA",se_col = "BETA_SE",pval_col = "P")
+    har<-harmonise_data(metabolite_format,sleep_format,action = 2)
+    har<-subset(har,har$mr_keep==TRUE)
+    har$MAF_e<-ifelse(har$eaf.exposure<0.5,har$eaf.exposure,1-har$eaf.exposure)
+    har$MAF_o<-ifelse(har$eaf.outcome<0.5,har$eaf.outcome,1-har$eaf.outcome)
+
+    result <- coloc.abf(dataset1=list(snp=har$SNP,beta=har$beta.outcome,
+                                      varbeta=(har$se.outcome)^2,position=har$pos.outcome, 
+                                      type="quant",N=452071,MAF=har$MAF_o), 
+                        dataset2=list(snp=har$SNP,beta=har$beta.exposure,
+                                      varbeta=(har$se.exposure)^2,position=har$pos.exposure,
+                                      type="quant",N=metabolite_N,MAF=har$MAF_e))
+  
+    need_result=(result$results %>% dplyr::arrange(desc(SNP.PP.H4)))[1,]
+    
+    #record results
+    need_result$metabolite<-metaboliteid
+    need_result$sleep<-sleepty
+    need_result$nsnps<-result[["summary"]][["nsnps"]]
+    need_result$PPH0<-result[["summary"]][["PP.H0.abf"]]
+    need_result$PPH1<-result[["summary"]][["PP.H1.abf"]]
+    need_result$PPH2<-result[["summary"]][["PP.H2.abf"]]
+    need_result$PPH3<-result[["summary"]][["PP.H3.abf"]]
+    need_result$PPH4<-result[["summary"]][["PP.H4.abf"]]
+  
+    coloc_res<-rbind(coloc_res,need_result)
+    rm(metabolite)
+    rm(input)
+  }
+}
+
+coloc_res<-coloc_res[-1,]
+
+write.csv(coloc_res,file = file.path(file_dir, "metabolite_daytimesleepiness_adjBMI_colocalization_500kb_res.csv"))
+
+rm(daytimesleepiness_adjBMI)
+```
+
+**Analysis block.** Chronotype.
+
+```{r coloc-01-11-chronotype}
+# Source file: 1_colocalization_abf_500kb.Rmd
+load(file.path(sleep_gwas_dir, "30696823", "chronotype_unadjBMI_UKB_2019_allSNP_hg38.RData"))
+chronotype <- get("dat_allSNP_hg38")
+rm(dat_allSNP_hg38)
+
+# Initialize the colocalization summary table
+coloc_res<-data.frame(metabolite=NA,sleep=NA,nsnps=NA,PPH0=NA,PPH1=NA,PPH2=NA,PPH3=NA,PPH4=NA,snp=NA,position=NA,V.df1=NA,z.df1=NA,r.df1=NA,lABF.df1=NA,V.df2=NA,z.df2=NA,r.df2=NA,lABF.df2=NA,internal.sum.lABF=NA,SNP.PP.H4=NA)
+
+for (sleepty in c("chronotype")) {
+  # Select metabolites significant for this sleep trait
+  signif_res<-subset(all_res,all_res$outcome==sleepty)
+  
+  chronotype<- chronotype[order(chronotype$P,decreasing = FALSE),]
+  chronotype<- chronotype[!duplicated(chronotype$SNP),]
+  
+  for (metaboliteid in signif_res$exposure) {
+    metabolite<-fread(paste(dat_dir,"GCST",metaboliteid,".tsv.gz",sep = ""))
+    
+    metabolite<- metabolite[order(metabolite$p_value,decreasing = FALSE),]
+    metabolite<- metabolite[!duplicated(metabolite$variant_id),]
+    
+    setnames(metabolite,"variant_id","SNP")
+    
+    metabolite_N<-catalog[catalog$exposure==metaboliteid,][[2]]
+    
+    load(paste(file.path(mr_output_dir, "harmonise_data"), "/", metaboliteid, "_chronotype_har3.RData", sep = ""))
+    top_chr<- exp_out_har3[order(exp_out_har3$pval.exposure,
+                                 decreasing = FALSE),][1,]$chr.exposure
+    top_bp<- exp_out_har3[order(exp_out_har3$pval.exposure,
+                                 decreasing = FALSE),][1,]$pos.exposure
+    
+    metabolite<-subset(metabolite,base_pair_location>top_bp-500000 & base_pair_location<top_bp+500000 & chromosome==top_chr)
+    sleept<-subset(chronotype,BP>top_bp-500000 & BP<top_bp+500000 & CHR==top_chr)
+    
+    input <- merge(sleept, metabolite, by="SNP", 
+                     all=FALSE, suffixes=c(".sl",".mt"))
+    
+    metabolite_format<-format_data(input,type = "exposure",snps = NULL,header = TRUE,snp_col = "SNP",chr_col = "chromosome",pos_col = "base_pair_location",effect_allele_col = "effect_allele",other_allele_col = "other_allele",eaf_col = "effect_allele_frequency",beta_col = "beta",se_col = "standard_error",pval_col = "p_value")
+    sleep_format<-format_data(input,type = "outcome",snps = input$SNP,header = TRUE,snp_col = "SNP",chr_col = "CHR",pos_col = "BP",effect_allele_col = "Effect_Allele",other_allele_col = "Other_Allele",eaf_col = "EAF",beta_col = "BETA",se_col = "BETA_SE",pval_col = "P")
+    har<-harmonise_data(metabolite_format,sleep_format,action = 2)
+    har<-subset(har,har$mr_keep==TRUE)
+    har$MAF_e<-ifelse(har$eaf.exposure<0.5,har$eaf.exposure,1-har$eaf.exposure)
+    har$MAF_o<-ifelse(har$eaf.outcome<0.5,har$eaf.outcome,1-har$eaf.outcome)
+
+    result <- coloc.abf(dataset1=list(snp=har$SNP,beta=har$beta.outcome,
+                                      varbeta=(har$se.outcome)^2,position=har$pos.outcome, 
+                                      type="quant",N=449734,MAF=har$MAF_o), 
+                        dataset2=list(snp=har$SNP,beta=har$beta.exposure,
+                                      varbeta=(har$se.exposure)^2,position=har$pos.exposure,
+                                      type="quant",N=metabolite_N,MAF=har$MAF_e))
+  
+    need_result=(result$results %>% dplyr::arrange(desc(SNP.PP.H4)))[1,]
+    
+    #record results
+    need_result$metabolite<-metaboliteid
+    need_result$sleep<-sleepty
+    need_result$nsnps<-result[["summary"]][["nsnps"]]
+    need_result$PPH0<-result[["summary"]][["PP.H0.abf"]]
+    need_result$PPH1<-result[["summary"]][["PP.H1.abf"]]
+    need_result$PPH2<-result[["summary"]][["PP.H2.abf"]]
+    need_result$PPH3<-result[["summary"]][["PP.H3.abf"]]
+    need_result$PPH4<-result[["summary"]][["PP.H4.abf"]]
+  
+    coloc_res<-rbind(coloc_res,need_result)
+    rm(metabolite)
+    rm(input)
+  }
+}
+
+coloc_res<-coloc_res[-1,]
+
+write.csv(coloc_res,file = file.path(file_dir, "metabolite_chronotype_colocalization_500kb_res.csv"))
+
+rm(chronotype)
+```
+
+**Analysis block.** Sleep duration.
+
+```{r coloc-01-12-sleep-duration}
+# Source file: 1_colocalization_abf_500kb.Rmd
+load(file.path(sleep_gwas_dir, "30846698", "sleep_duration_unadjBMI_UKB_2019_allSNP_hg38.RData"))
+sleepduration <- get("dat_allSNP_hg38")
+rm(dat_allSNP_hg38)
+
+# Initialize the colocalization summary table
+coloc_res<-data.frame(metabolite=NA,sleep=NA,nsnps=NA,PPH0=NA,PPH1=NA,PPH2=NA,PPH3=NA,PPH4=NA,snp=NA,position=NA,V.df1=NA,z.df1=NA,r.df1=NA,lABF.df1=NA,V.df2=NA,z.df2=NA,r.df2=NA,lABF.df2=NA,internal.sum.lABF=NA,SNP.PP.H4=NA)
+
+for (sleepty in c("sleepduration")) {
+  # Select metabolites significant for this sleep trait
+  signif_res<-subset(all_res,all_res$outcome==sleepty)
+  
+  sleepduration<- sleepduration[order(sleepduration$P,decreasing = FALSE),]
+  sleepduration<- sleepduration[!duplicated(sleepduration$SNP),]
+  
+  for (metaboliteid in signif_res$exposure) {
+    metabolite<-fread(paste(dat_dir,"GCST",metaboliteid,".tsv.gz",sep = ""))
+    
+    metabolite<- metabolite[order(metabolite$p_value,decreasing = FALSE),]
+    metabolite<- metabolite[!duplicated(metabolite$variant_id),]
+    
+    setnames(metabolite,"variant_id","SNP")
+    
+    metabolite_N<-catalog[catalog$exposure==metaboliteid,][[2]]
+    
+    load(paste(file.path(mr_output_dir, "harmonise_data"), "/", metaboliteid, "_sleepduration_har3.RData", sep = ""))
+    top_chr<- exp_out_har3[order(exp_out_har3$pval.exposure,
+                                 decreasing = FALSE),][1,]$chr.exposure
+    top_bp<- exp_out_har3[order(exp_out_har3$pval.exposure,
+                                 decreasing = FALSE),][1,]$pos.exposure
+    
+    metabolite<-subset(metabolite,base_pair_location>top_bp-500000 & base_pair_location<top_bp+500000 & chromosome==top_chr)
+    sleept<-subset(sleepduration,BP>top_bp-500000 & BP<top_bp+500000 & CHR==top_chr)
+    
+    input <- merge(sleept, metabolite, by="SNP", 
+                     all=FALSE, suffixes=c(".sl",".mt"))
+    
+    metabolite_format<-format_data(input,type = "exposure",snps = NULL,header = TRUE,snp_col = "SNP",chr_col = "chromosome",pos_col = "base_pair_location",effect_allele_col = "effect_allele",other_allele_col = "other_allele",eaf_col = "effect_allele_frequency",beta_col = "beta",se_col = "standard_error",pval_col = "p_value")
+    sleep_format<-format_data(input,type = "outcome",snps = input$SNP,header = TRUE,snp_col = "SNP",chr_col = "CHR",pos_col = "BP",effect_allele_col = "Effect_Allele",other_allele_col = "Other_Allele",eaf_col = "EAF",beta_col = "BETA",se_col = "BETA_SE",pval_col = "P")
+    har<-harmonise_data(metabolite_format,sleep_format,action = 2)
+    har<-subset(har,har$mr_keep==TRUE)
+    har$MAF_e<-ifelse(har$eaf.exposure<0.5,har$eaf.exposure,1-har$eaf.exposure)
+    har$MAF_o<-ifelse(har$eaf.outcome<0.5,har$eaf.outcome,1-har$eaf.outcome)
+
+    result <- coloc.abf(dataset1=list(snp=har$SNP,beta=har$beta.outcome,
+                                      varbeta=(har$se.outcome)^2,position=har$pos.outcome, 
+                                      type="quant",N=446118,MAF=har$MAF_o), 
+                        dataset2=list(snp=har$SNP,beta=har$beta.exposure,
+                                      varbeta=(har$se.exposure)^2,position=har$pos.exposure,
+                                      type="quant",N=metabolite_N,MAF=har$MAF_e))
+  
+    need_result=(result$results %>% dplyr::arrange(desc(SNP.PP.H4)))[1,]
+    
+    #record results
+    need_result$metabolite<-metaboliteid
+    need_result$sleep<-sleepty
+    need_result$nsnps<-result[["summary"]][["nsnps"]]
+    need_result$PPH0<-result[["summary"]][["PP.H0.abf"]]
+    need_result$PPH1<-result[["summary"]][["PP.H1.abf"]]
+    need_result$PPH2<-result[["summary"]][["PP.H2.abf"]]
+    need_result$PPH3<-result[["summary"]][["PP.H3.abf"]]
+    need_result$PPH4<-result[["summary"]][["PP.H4.abf"]]
+  
+    coloc_res<-rbind(coloc_res,need_result)
+    rm(metabolite)
+    rm(input)
+  }
+}
+
+coloc_res<-coloc_res[-1,]
+
+write.csv(coloc_res,file = file.path(file_dir, "metabolite_sleepduration_colocalization_500kb_res.csv"))
+
+rm(sleepduration)
+```
+
+**Analysis block.** Napping.
+
+```{r coloc-01-13-napping}
+# Source file: 1_colocalization_abf_500kb.Rmd
+load(file.path(sleep_gwas_dir, "33568662", "daytime_napping_unadjBMI_UKB_2021_allSNP_hg38.RData"))
+napping <- get("dat_allSNP_hg38")
+rm(dat_allSNP_hg38)
+
+# Initialize the colocalization summary table
+coloc_res<-data.frame(metabolite=NA,sleep=NA,nsnps=NA,PPH0=NA,PPH1=NA,PPH2=NA,PPH3=NA,PPH4=NA,snp=NA,position=NA,V.df1=NA,z.df1=NA,r.df1=NA,lABF.df1=NA,V.df2=NA,z.df2=NA,r.df2=NA,lABF.df2=NA,internal.sum.lABF=NA,SNP.PP.H4=NA)
+
+for (sleepty in c("napping")) {
+  # Select metabolites significant for this sleep trait
+  signif_res<-subset(all_res,all_res$outcome==sleepty)
+  
+  napping<- napping[order(napping$P,decreasing = FALSE),]
+  napping<- napping[!duplicated(napping$SNP),]
+  
+  for (metaboliteid in signif_res$exposure) {
+    metabolite<-fread(paste(dat_dir,"GCST",metaboliteid,".tsv.gz",sep = ""))
+    
+    metabolite<- metabolite[order(metabolite$p_value,decreasing = FALSE),]
+    metabolite<- metabolite[!duplicated(metabolite$variant_id),]
+    
+    setnames(metabolite,"variant_id","SNP")
+    
+    metabolite_N<-catalog[catalog$exposure==metaboliteid,][[2]]
+    
+    load(paste(file.path(mr_output_dir, "harmonise_data"), "/", metaboliteid, "_napping_har3.RData", sep = ""))
+    top_chr<- exp_out_har3[order(exp_out_har3$pval.exposure,
+                                 decreasing = FALSE),][1,]$chr.exposure
+    top_bp<- exp_out_har3[order(exp_out_har3$pval.exposure,
+                                 decreasing = FALSE),][1,]$pos.exposure
+    
+    metabolite<-subset(metabolite,base_pair_location>top_bp-500000 & base_pair_location<top_bp+500000 & chromosome==top_chr)
+    sleept<-subset(napping,BP>top_bp-500000 & BP<top_bp+500000 & CHR==top_chr)
+    
+    input <- merge(sleept, metabolite, by="SNP", 
+                     all=FALSE, suffixes=c(".sl",".mt"))
+    
+    metabolite_format<-format_data(input,type = "exposure",snps = NULL,header = TRUE,snp_col = "SNP",chr_col = "chromosome",pos_col = "base_pair_location",effect_allele_col = "effect_allele",other_allele_col = "other_allele",eaf_col = "effect_allele_frequency",beta_col = "beta",se_col = "standard_error",pval_col = "p_value")
+    sleep_format<-format_data(input,type = "outcome",snps = input$SNP,header = TRUE,snp_col = "SNP",chr_col = "CHR",pos_col = "BP",effect_allele_col = "Effect_Allele",other_allele_col = "Other_Allele",eaf_col = "EAF",beta_col = "BETA",se_col = "BETA_SE",pval_col = "P")
+    har<-harmonise_data(metabolite_format,sleep_format,action = 2)
+    har<-subset(har,har$mr_keep==TRUE)
+    har$MAF_e<-ifelse(har$eaf.exposure<0.5,har$eaf.exposure,1-har$eaf.exposure)
+    har$MAF_o<-ifelse(har$eaf.outcome<0.5,har$eaf.outcome,1-har$eaf.outcome)
+
+    result <- coloc.abf(dataset1=list(snp=har$SNP,beta=har$beta.outcome,
+                                      varbeta=(har$se.outcome)^2,position=har$pos.outcome, 
+                                      type="quant",N=452633,MAF=har$MAF_o), 
+                        dataset2=list(snp=har$SNP,beta=har$beta.exposure,
+                                      varbeta=(har$se.exposure)^2,position=har$pos.exposure,
+                                      type="quant",N=metabolite_N,MAF=har$MAF_e))
+  
+    need_result=(result$results %>% dplyr::arrange(desc(SNP.PP.H4)))[1,]
+    
+    #record results
+    need_result$metabolite<-metaboliteid
+    need_result$sleep<-sleepty
+    need_result$nsnps<-result[["summary"]][["nsnps"]]
+    need_result$PPH0<-result[["summary"]][["PP.H0.abf"]]
+    need_result$PPH1<-result[["summary"]][["PP.H1.abf"]]
+    need_result$PPH2<-result[["summary"]][["PP.H2.abf"]]
+    need_result$PPH3<-result[["summary"]][["PP.H3.abf"]]
+    need_result$PPH4<-result[["summary"]][["PP.H4.abf"]]
+  
+    coloc_res<-rbind(coloc_res,need_result)
+    rm(metabolite)
+    rm(input)
+  }
+}
+
+coloc_res<-coloc_res[-1,]
+
+write.csv(coloc_res,file = file.path(file_dir, "metabolite_napping_colocalization_500kb_res.csv"))
+
+rm(napping)
+```
+
+## 2. Nearest genes for significant colocalization SNPs
+
+This section annotates significant SNPs with genes within 100 kb and selects the nearest gene for each SNP.
+
+```{r coloc-02-01-nearest-genes}
+# Source file: 2_significantRSID_100kb_genesLIST_NearestGene.Rmd
+dat<-read_excel(file.path(reference_dir, "colocalization_sigsnpinfo.xlsx"), sheet = "Sheet1")
+
+res<-find_nearest_gene(dat, flanking = 100, build = "hg38",
+  collapse = FALSE, snp = "SNP", chr = "CHR",
+  bp = "POS")
+
+res$abs_distance<-NA
+temp<-subset(res,res$distance=="intergenic")
+for (i in 1:nrow(temp)) {
+  dsstart<-temp[i,"position"]-temp[i,"geneSTART"]
+  dsstop<-temp[i,"geneSTOP"]-temp[i,"position"]
+  temp[i,"abs_distance"]<-abs(ifelse(dsstart<dsstop,dsstart,dsstop))
+}
+
+res<-subset(res,res$distance!="intergenic")
+res$distance<-as.integer(res$distance)
+for (i in 1:nrow(res)) {
+  res[i,"abs_distance"]<-abs(res[i,"distance"])
+}
+
+res<-rbind(res,temp)
+
+res_nearestgene<-data.frame(rsid=NA,Gene=NA,distance=NA)
+i<-1
+for (rs in unique(res$rsid)) {
+  res_nearestgene[i+1,]<-NA
+  temp<-subset(res,res$rsid==rs)
+  nearest_distance<-min(temp$abs_distance)
+  res_nearestgene[i,"rsid"]<-rs
+  res_nearestgene[i,"Gene"]<-subset(temp,temp$abs_distance==nearest_distance)[1,"GENE"]
+  res_nearestgene[i,"distance"]<-nearest_distance
+  i<-i+1
+}
+
+write.xlsx(res, file.path(coloc_output_dir, "significantRSID_100kb_genesLIST.xlsx"))
+write.xlsx(res_nearestgene, file.path(coloc_output_dir, "significantRSID_100kb_NearestGeneLIST.xlsx"))
+```
+
+## 3. SuSiE colocalization with a local 1000 Genomes EUR LD panel
+
+This section identifies credible sets in metabolite and sleep traits and evaluates each credible-set pair with `coloc.susie`. The explanatory narrative from the original file is summarized by the chunk purposes below.
+
+**Analysis block.** Select metabolites for colocalization.
+
+```{r coloc-03-01-select-colocalization-metabolites}
+# Source file: 3_colocalization_susie_localLD_500kb.Rmd
+all_res<-read_excel(significant_mr_file, sheet = "Sheet 1")
+
+# Select metabolite levels only (exclude ratio variables)
+all_res<-subset(all_res,gene_shared_protein == "NA")
+```
+
+**Analysis block.** Configure paths and LD-panel parameters.
+
+```{r coloc-03-02-configure-paths}
+# Source file: 3_colocalization_susie_localLD_500kb.Rmd
+dat_dir <- metabolite_gwas_dir
+file_dir <- coloc_output_dir
+
+ld_bfile <- file.path(data_dir, "LD_Reference", "EUR")     # 1000G phase3 EUR, n=503
+ld_plink_bin <- plinkbinr::get_plink_exe()
+ld_maf_min   <- 0.01
+ld_memory_mb <- 4000
+
+date_tag <- ""
+
+save_table <- function(x, path) {
+  openxlsx::write.xlsx(as.data.frame(x), file = path, rowNames = FALSE, overwrite = TRUE)
+  invisible(path)
+}
+```
+
+**Analysis block.** Obtain metabolite sample sizes from GWAS Catalog.
+
+```{r coloc-03-03-catalog-sample-size}
+# Source file: 3_colocalization_susie_localLD_500kb.Rmd
+catalog<-fread(catalog_file)
+
+catalog<-subset(catalog,catalog$firstAuthor=="Chen Y")
+catalog<-subset(catalog,catalog$pubmedId=="36635386")
+
+catalog$Ancestry<- sapply(catalog$discoverySampleAncestry,function(x){
+        temp <- strsplit(x, split = " ")[[1]][2]
+				return(as.character(temp))	
+				})
+catalog<-subset(catalog,catalog$Ancestry=="European")
+
+catalog$exposure<- sapply(catalog$accessionId,function(x){
+        temp <- strsplit(x, split = "T")[[1]][2]
+				return(as.character(temp))	
+				})
+
+catalog$N<- sapply(catalog$discoverySampleAncestry,function(x){
+        temp <- strsplit(x, split = " ")[[1]][1]
+				return(as.numeric(temp))	
+				})
+catalog<-catalog[,c("exposure","N")]
+```
+
+**Analysis block.** Functions for extracting local LD.
+
+```{r coloc-03-04-ld-panel-functions}
+# Source file: 3_colocalization_susie_localLD_500kb.Rmd
+########################################################################
+##
+########################################################################
+get_ld_panel <- function(snps, bfile = ld_bfile, plink_bin = ld_plink_bin,
+                         maf_min = ld_maf_min, memory_mb = ld_memory_mb,
+                         keep_files = FALSE) {
+  snps <- unique(snps[!is.na(snps) & snps != ""])
+  if (length(snps) == 0) stop("SNP list is empty")
+
+  td <- tempfile("ld_")
+  dir.create(td)
+  writeLines(snps, file.path(td, "snplist.txt"))
+
+  args <- c("--bfile", bfile,
+            "--extract", file.path(td, "snplist.txt"),
+            "--keep-allele-order",
+            "--maf", format(maf_min, scientific = FALSE),
+            "--freq",
+            "--r", "square",
+            "--memory", as.character(memory_mb),
+            "--out", file.path(td, "ld"))
+  log <- suppressWarnings(system2(plink_bin, args, stdout = TRUE, stderr = TRUE))
+
+  f_ld  <- file.path(td, "ld.ld")
+  f_frq <- file.path(td, "ld.frq")
+  if (!file.exists(f_ld) || !file.exists(f_frq)) {
+    stop("PLINK did not generate LD files; check the PLINK executable and reference-panel paths:\n",
+         paste(tail(log, 15), collapse = "\n"))
+  }
+
+  frq <- fread(f_frq)
+  setnames(frq, 1:6, c("chr", "snp", "a1", "a2", "maf", "nchrobs"))
+
+  ld <- as.matrix(fread(f_ld, header = FALSE))
+  if (nrow(ld) != nrow(frq)) {
+    stop("LD matrix dimension (", nrow(ld), ") does not match the reference-panel SNP count (", nrow(frq), ")")
+  }
+  ld <- (ld + t(ld)) / 2      # Symmetrize the matrix to remove minor text-output rounding errors
+  diag(ld) <- 1
+  rownames(ld) <- colnames(ld) <- frq$snp
+
+  if (!keep_files) unlink(td, recursive = TRUE)
+  list(ld = ld, panel = as.data.frame(frq[, .(snp, a1, a2, maf)]))
+}
+
+########################################################################
+########################################################################
+comp_map <- c(A = "T", T = "A", C = "G", G = "C")
+
+allele_flip_dir <- function(ea, oa, a1, a2) {
+  ea <- toupper(as.character(ea))
+  oa <- toupper(as.character(oa))
+  ok <- !is.na(ea) & !is.na(oa)
+
+  d <- ifelse(ok & ea == a1 & oa == a2,  1L, 0L)
+  d <- ifelse(ok & ea == a2 & oa == a1, -1L, d)
+
+  ea_c <- unname(comp_map[ea])
+  oa_c <- unname(comp_map[oa])
+  ok_c <- !is.na(ea_c) & !is.na(oa_c)
+  d_c  <- ifelse(ok_c & ea_c == a1 & oa_c == a2,  1L, 0L)
+  d_c  <- ifelse(ok_c & ea_c == a2 & oa_c == a1, -1L, d_c)
+
+  ifelse(d == 0L, d_c, d)
+}
+
+########################################################################
+########################################################################
+estimate_N <- function(beta, se, eaf, n_sample = 20000, maf_range = c(0.05, 0.5)) {
+  maf <- pmin(eaf, 1 - eaf)
+  ok <- which(!is.na(maf) & maf > maf_range[1] & maf < maf_range[2] &
+              !is.na(se) & se > 0 & !is.na(beta))
+  if (length(ok) == 0) return(NA_real_)
+  if (length(ok) > n_sample) ok <- sample(ok, n_sample)
+  median(1 / (2 * maf[ok] * (1 - maf[ok]) * se[ok]^2))
+}
+```
+
+**Analysis block.** Functions for locus-level coloc.susie.
+
+```{r coloc-03-05-locus-coloc-susie-functions}
+# Source file: 3_colocalization_susie_localLD_500kb.Rmd
+########################################################################
+########################################################################
+cs_info <- function(s, idx_label) {
+  out <- list(snps = NA_character_, size = NA_integer_, coverage = NA_real_,
+              log10bf = NA_real_, avg.r2 = NA_real_, min.r2 = NA_real_,
+              purity.min.abs.r = NA_real_, purity.mean.abs.r = NA_real_,
+              purity.median.abs.r = NA_real_)
+  if (is.null(s) || is.null(s$sets) || is.null(s$sets$cs) || length(s$sets$cs) == 0) return(out)
+  pos <- match(idx_label, s$sets$cs_index)
+  if (is.na(pos) || pos > length(s$sets$cs)) return(out)
+
+  cs   <- s$sets$cs[[pos]]
+  snps <- if (!is.null(names(cs))) names(cs) else as.character(cs)
+  out$snps     <- paste(snps, collapse = ",")
+  out$size     <- length(cs)
+  out$coverage <- s$sets$coverage[pos]
+  out$log10bf  <- s$lbf[idx_label] / log(10)
+  if (!is.null(s$sets$purity)) {
+    out$purity.min.abs.r    <- s$sets$purity$min.abs.corr[pos]
+    out$purity.mean.abs.r   <- s$sets$purity$mean.abs.corr[pos]
+    out$purity.median.abs.r <- s$sets$purity$median.abs.corr[pos]
+    out$avg.r2 <- s$sets$purity$mean.abs.corr[pos]^2
+    out$min.r2 <- s$sets$purity$min.abs.corr[pos]^2
+  }
+  out
+}
+
+########################################################################
+########################################################################
+run_coloc_susie_locus <- function(har, sleep_N, metabolite_N,
+                                  sleep_type = "cc", sleep_s = NA_real_,
+                                  bfile = ld_bfile, plink_bin = ld_plink_bin,
+                                  maf_min = ld_maf_min, susie.args = list(),
+                                  also_abf = FALSE, sens_threshold = 0.8,
+                                  sens_npoints = 100) {
+  har <- as.data.frame(har)
+  out <- list(status = "ok", nsnps = NA_integer_, nsnps_har = nrow(har),
+              nsnps_ld = NA_integer_, ld_match_rate = NA_real_, n_cs_sleep = NA_integer_,
+              n_cs_metabolite = NA_integer_, summary = NULL, snp_results = NULL,
+              minp_sleep = NA_real_,
+              converged_sleep = NA, converged_metabolite = NA,
+              pairs = NULL, abf_summary = NULL)
+  if (nrow(har) < 2) { out$status <- "too_few_harmonised_snps"; return(out) }
+  if (is.na(sleep_N) || is.na(metabolite_N)) { out$status <- "N_missing"; return(out) }
+
+  g <- tryCatch(get_ld_panel(har$SNP, bfile = bfile, plink_bin = plink_bin, maf_min = maf_min),
+                error = function(e) e)
+  if (inherits(g, "error")) {
+    out$status <- paste0("ld_panel_failed: ", conditionMessage(g))
+    return(out)
+  }
+  panel <- g$panel
+  ld    <- g$ld
+
+  idx  <- match(har$SNP, panel$snp)
+  flip <- rep(0L, nrow(har))
+  j    <- which(!is.na(idx))
+  if (length(j) > 0) {
+    flip[j] <- allele_flip_dir(har$effect_allele.exposure[j], har$other_allele.exposure[j],
+                               panel$a1[idx[j]], panel$a2[idx[j]])
+  }
+
+  maf_e <- pmin(har$eaf.exposure, 1 - har$eaf.exposure)
+  maf_o <- pmin(har$eaf.outcome,  1 - har$eaf.outcome)
+  keep <- !is.na(idx) & flip != 0 &
+          is.finite(har$beta.exposure) & is.finite(har$beta.outcome) &
+          is.finite(har$se.exposure)   & is.finite(har$se.outcome) &
+          har$se.exposure > 0 & har$se.outcome > 0 &
+          is.finite(maf_e) & maf_e > 0 & maf_e < 1 &
+          is.finite(maf_o) & maf_o > 0 & maf_o < 1 &
+          is.finite(har$pos.exposure) & is.finite(har$pos.outcome)
+
+  out$nsnps_ld      <- sum(keep)
+  out$ld_match_rate <- round(sum(keep) / nrow(har), 3)
+  if (sum(keep) < 2) { out$status <- "too_few_snps_in_LD_panel"; return(out) }
+
+  out$minp_sleep <- min(har$pval.outcome[keep], na.rm = TRUE)
+
+  snps <- har$SNP[keep]
+  sgn  <- flip[keep]
+  LD   <- ld[idx[keep], idx[keep], drop = FALSE]
+  dimnames(LD) <- list(snps, snps)
+
+  d_sleep <- list(snp = snps,
+                  beta = har$beta.outcome[keep] * sgn,
+                  varbeta = har$se.outcome[keep]^2,
+                  position = as.numeric(har$pos.outcome[keep]),
+                  type = sleep_type, N = sleep_N, MAF = maf_o[keep], LD = LD)
+  if (!is.na(sleep_s)) d_sleep$s <- sleep_s
+
+  d_met <- list(snp = snps,
+                beta = har$beta.exposure[keep] * sgn,
+                varbeta = har$se.exposure[keep]^2,
+                position = as.numeric(har$pos.exposure[keep]),
+                type = "quant", N = metabolite_N, MAF = maf_e[keep], LD = LD)
+
+  ## 5.4 runsusie
+  s_sleep <- tryCatch(do.call(coloc::runsusie, c(list(d = d_sleep, suffix = 1), susie.args)),
+                      error = function(e) e)
+  if (inherits(s_sleep, "error")) {
+    out$status <- paste0("runsusie_sleep_failed: ", conditionMessage(s_sleep))
+    return(out)
+  }
+  s_met <- tryCatch(do.call(coloc::runsusie, c(list(d = d_met, suffix = 2), susie.args)),
+                    error = function(e) e)
+  if (inherits(s_met, "error")) {
+    out$status <- paste0("runsusie_metabolite_failed: ", conditionMessage(s_met))
+    return(out)
+  }
+  out$n_cs_sleep      <- length(s_sleep$sets$cs)
+  out$n_cs_metabolite <- length(s_met$sets$cs)
+  out$converged_sleep      <- isTRUE(s_sleep$converged)
+  out$converged_metabolite <- isTRUE(s_met$converged)
+
+  if (also_abf) {
+    abf <- tryCatch({
+      a_sleep <- list(snp = snps, beta = d_sleep$beta, varbeta = d_sleep$varbeta,
+                      position = d_sleep$position, type = sleep_type,
+                      N = sleep_N, MAF = d_sleep$MAF)
+      if (!is.na(sleep_s)) a_sleep$s <- sleep_s
+      a_met <- list(snp = snps, beta = d_met$beta, varbeta = d_met$varbeta,
+                    position = d_met$position, type = "quant",
+                    N = metabolite_N, MAF = d_met$MAF)
+      tmp <- NULL
+      utils::capture.output(tmp <- suppressWarnings(coloc::coloc.abf(a_sleep, a_met)),
+                            type = "output")
+      as.data.frame(as.list(tmp$summary), stringsAsFactors = FALSE)
+    }, error = function(e) e)
+    if (!inherits(abf, "error")) out$abf_summary <- abf
+  }
+
+  cs <- tryCatch(coloc::coloc.susie(s_sleep, s_met), error = function(e) e)
+  if (inherits(cs, "error")) {
+    out$status <- paste0("coloc_susie_failed: ", conditionMessage(cs))
+    return(out)
+  }
+  sm <- as.data.frame(cs$summary)
+  if (!("PP.H4.abf" %in% names(sm))) {
+    out$status <- if (out$n_cs_sleep == 0 && out$n_cs_metabolite == 0) "no_credible_set_both"
+                  else if (out$n_cs_sleep == 0) "no_credible_set_sleep"
+                  else if (out$n_cs_metabolite == 0) "no_credible_set_metabolite"
+                  else "no_credible_set"
+    return(out)
+  }
+
+  out$summary     <- sm
+  out$snp_results <- as.data.frame(cs$results)
+
+  pr <- cs$priors
+  pairs <- vector("list", nrow(sm))
+  detail <- vector("list", nrow(sm))
+  for (p in seq_len(nrow(sm))) {
+    pp_col <- if ("SNP.PP.H4.abf" %in% names(out$snp_results)) "SNP.PP.H4.abf"
+              else paste0("SNP.PP.H4.row", p)
+    ppv <- out$snp_results[[pp_col]]
+    h1  <- as.character(sm$hit1[p]); h2 <- as.character(sm$hit2[p])
+    c1  <- cs_info(s_sleep, sm$idx1[p])
+    c2  <- cs_info(s_met,   sm$idx2[p])
+    top_i <- which.max(ppv)
+
+    sens <- tryCatch({
+      tmp <- NULL
+      suppressMessages(utils::capture.output(
+        tmp <- coloc::sensitivity(cs, paste0("H4 > ", sens_threshold), row = p,
+                                  npoints = sens_npoints, doplot = FALSE),
+        type = "output"))
+      tmp
+    }, error = function(e) NULL)
+    p12min <- p12max <- NA_real_
+    if (!is.null(sens)) {
+      okp <- sens[, "p12"][sens[, "PP.H4.abf"] > sens_threshold]
+      if (length(okp) > 0) { p12min <- min(okp); p12max <- max(okp) }
+    }
+
+    ##     top.SNP.PP.H4     = max over SNPs of SNP.PP.H4, the posterior probability that a SNP
+    ##                         is the shared causal variant given H4 (normalised to sum to 1
+    ##                         over the SNPs of this signal pair);
+    ##     top.SNP.PP.H4.snp = the SNP attaining that maximum.
+    pairs[[p]] <- data.frame(
+      idx1 = sm$idx1[p], idx2 = sm$idx2[p],
+      hit1 = h1, hit2 = h2,
+      top.SNP.PP.H4.snp = out$snp_results$snp[top_i], top.SNP.PP.H4 = ppv[top_i],
+      PP.H0.abf = sm$PP.H0.abf[p], PP.H1.abf = sm$PP.H1.abf[p],
+      PP.H2.abf = sm$PP.H2.abf[p], PP.H3.abf = sm$PP.H3.abf[p],
+      PP.H4.abf = sm$PP.H4.abf[p],
+      stringsAsFactors = FALSE)
+
+    detail[[p]] <- data.frame(
+      idx1 = sm$idx1[p], idx2 = sm$idx2[p],
+      hit1 = h1, hit1.PIP = as.numeric(s_sleep$pip[match(h1, names(s_sleep$pip))]),
+      hit1.SNP.PP.H4 = ppv[match(h1, out$snp_results$snp)],
+      hit1.CS.snps = c1$snps, hit1.CS.size = c1$size, hit1.CS.coverage = c1$coverage,
+      hit1.CS.log10bf = c1$log10bf, hit1.CS.avg.r2 = c1$avg.r2, hit1.CS.min.r2 = c1$min.r2,
+      hit1.CS.purity.min.abs.r = c1$purity.min.abs.r,
+      hit2 = h2, hit2.PIP = as.numeric(s_met$pip[match(h2, names(s_met$pip))]),
+      hit2.SNP.PP.H4 = ppv[match(h2, out$snp_results$snp)],
+      hit2.CS.snps = c2$snps, hit2.CS.size = c2$size, hit2.CS.coverage = c2$coverage,
+      hit2.CS.log10bf = c2$log10bf, hit2.CS.avg.r2 = c2$avg.r2, hit2.CS.min.r2 = c2$min.r2,
+      hit2.CS.purity.min.abs.r = c2$purity.min.abs.r,
+      top.SNP.PP.H4.snp = out$snp_results$snp[top_i], top.SNP.PP.H4 = ppv[top_i],
+      PP.H0.abf = sm$PP.H0.abf[p], PP.H1.abf = sm$PP.H1.abf[p],
+      PP.H2.abf = sm$PP.H2.abf[p], PP.H3.abf = sm$PP.H3.abf[p],
+      PP.H4.abf = sm$PP.H4.abf[p],
+      p1 = as.numeric(pr["p1"]), p2 = as.numeric(pr["p2"]), p12 = as.numeric(pr["p12"]),
+      p12.min.H4.gt.thr = p12min, p12.max.H4.gt.thr = p12max,
+      stringsAsFactors = FALSE)
+  }
+  out$pairs        <- do.call(rbind, pairs)
+  out$pairs_detail <- do.call(rbind, detail)
+  out$nsnps <- sm$nsnps[1]
+  out
+}
+
+########################################################################
+##
+##    Column definitions (English wording, for comments / table legends):
+##      nsnps      : number of SNPs used by coloc.susie() in this region.
+##                   NA means coloc.susie() was not run because at least one trait
+##                   had no credible set in the region (see `status`).
+##      n_cs_sleep / n_cs_metabolite : number of credible sets (= independent signals)
+##                   detected by SuSiE in the sleep trait / metabolite trait in this region.
+##      idx1       : index (label) of the credible set in dataset 1 (the sleep trait)
+##                   that this row refers to.
+##      idx2       : index (label) of the credible set in dataset 2 (the metabolite trait)
+##                   that this row refers to.
+##                   One row = one pair of signals tested for colocalisation (CS idx1 x CS idx2).
+##      hit1       : lead (tag) SNP of credible set idx1 - the SNP with the largest single-SNP
+##                   log Bayes factor within that signal in dataset 1 (sleep trait).
+##      hit2       : lead (tag) SNP of credible set idx2 in dataset 2 (metabolite trait).
+##      PP.H0.abf  : posterior probability of H0 - no causal variant for either trait in the region.
+##      PP.H1.abf  : posterior probability of H1 - a causal variant for trait 1 (sleep) only.
+##      PP.H2.abf  : posterior probability of H2 - a causal variant for trait 2 (metabolite) only.
+##      PP.H3.abf  : posterior probability of H3 - causal variants for both traits, but two
+##                   distinct variants (no colocalisation; the shared association is explained
+##                   by linkage disequilibrium rather than by a common causal variant).
+##      PP.H4.abf  : posterior probability of H4 - both traits share a single causal variant
+##                   (colocalisation). PP.H0 + PP.H1 + PP.H2 + PP.H3 + PP.H4 = 1.
+##      top.SNP.PP.H4.snp / top.SNP.PP.H4 :
+##                   Taken from coloc.susie()$results (the SNP-level table). For each pair of
+##                   signals, SNP.PP.H4 is the posterior probability that a given SNP is the
+##                   shared causal variant, conditional on H4 (i.e. assuming that the two traits
+##                   do share a single causal variant). It is computed from the product of the
+##                   two traits' single-SNP log Bayes factors for that pair of signals and is
+##                   normalised to sum to 1 over all SNPs analysed in the region.
+##                   top.SNP.PP.H4     = the maximum of this posterior over all SNPs in the pair,
+##                                       i.e. "if the two traits do colocalise, how likely is the
+##                                       most likely shared causal variant?"
+##                   top.SNP.PP.H4.snp = the SNP that achieves this maximum.
+##                   Notes:
+##                     * It describes WHICH SNP is most likely to be the shared variant; it does
+##                       NOT say whether the traits colocalise - always read it together with
+##                       PP.H4.abf (and PP.H3.abf).
+##                     * top.SNP.PP.H4 >= hit1.SNP.PP.H4 and >= hit2.SNP.PP.H4, because it takes
+##                       the maximum over all SNPs in the region, whereas hit1/hit2 refer only to
+##                       the lead SNPs of the two credible sets.
+##                     * High PP.H4.abf with high top.SNP.PP.H4 (e.g. >0.5) supports naming this
+##                       SNP as the candidate shared causal variant; if PP.H4.abf is high but
+##                       top.SNP.PP.H4 is low (posterior spread over many SNPs in strong LD),
+##                       the shared variant can only be localised to the credible set / LD block,
+##                       not to a single SNP.
+##                     * NA when status != "ok", because coloc.susie() did not run (at least one
+##                       trait has no credible set in the region).
+##      status     : ok = both traits have a credible set and the PPs above are valid;
+##                   no_credible_set_sleep / _metabolite / _both = at least one trait has no
+##                   credible set, so colocalisation cannot be evaluated (NOT evidence against
+##                   colocalisation); other values = technical failures (details appended).
+########################################################################
+new_res_row <- function() {
+  data.frame(
+    metabolite = NA_character_, sleep = NA_character_,
+    top_chr = NA_integer_, top_bp = NA_real_,
+    n_cs_sleep = NA_integer_, n_cs_metabolite = NA_integer_,
+    nsnps = NA_integer_, idx1 = NA_integer_, idx2 = NA_integer_,
+    hit1 = NA_character_, hit2 = NA_character_,
+    top.SNP.PP.H4.snp = NA_character_, top.SNP.PP.H4 = NA_real_,
+    PP.H0.abf = NA_real_, PP.H1.abf = NA_real_, PP.H2.abf = NA_real_,
+    PP.H3.abf = NA_real_, PP.H4.abf = NA_real_,
+    status = NA_character_, stringsAsFactors = FALSE)
+}
+
+new_detail_row <- function(with_abf = FALSE) {
+  r <- data.frame(
+    metabolite = NA_character_, sleep = NA_character_,
+    top_chr = NA_integer_, top_bp = NA_real_,
+    nsnps = NA_integer_, nsnps_har = NA_integer_, nsnps_ld = NA_integer_,
+    ld_match_rate = NA_real_, n_cs_sleep = NA_integer_, n_cs_metabolite = NA_integer_,
+    idx1 = NA_integer_, idx2 = NA_integer_,
+    hit1 = NA_character_, hit1.PIP = NA_real_, hit1.SNP.PP.H4 = NA_real_,
+    hit1.CS.snps = NA_character_, hit1.CS.size = NA_integer_, hit1.CS.coverage = NA_real_,
+    hit1.CS.log10bf = NA_real_, hit1.CS.avg.r2 = NA_real_, hit1.CS.min.r2 = NA_real_,
+    hit1.CS.purity.min.abs.r = NA_real_,
+    hit2 = NA_character_, hit2.PIP = NA_real_, hit2.SNP.PP.H4 = NA_real_,
+    hit2.CS.snps = NA_character_, hit2.CS.size = NA_integer_, hit2.CS.coverage = NA_real_,
+    hit2.CS.log10bf = NA_real_, hit2.CS.avg.r2 = NA_real_, hit2.CS.min.r2 = NA_real_,
+    hit2.CS.purity.min.abs.r = NA_real_,
+    top.SNP.PP.H4.snp = NA_character_, top.SNP.PP.H4 = NA_real_,
+    PP.H0.abf = NA_real_, PP.H1.abf = NA_real_, PP.H2.abf = NA_real_,
+    PP.H3.abf = NA_real_, PP.H4.abf = NA_real_,
+    p1 = NA_real_, p2 = NA_real_, p12 = NA_real_,
+    p12.min.H4.gt.thr = NA_real_, p12.max.H4.gt.thr = NA_real_,
+    minp_sleep = NA_real_, converged_sleep = NA, converged_metabolite = NA,
+    status = NA_character_, stringsAsFactors = FALSE)
+  if (with_abf) {
+    r$abf_nsnps <- NA_real_
+    r$abf_PPH0 <- NA_real_; r$abf_PPH1 <- NA_real_; r$abf_PPH2 <- NA_real_
+    r$abf_PPH3 <- NA_real_; r$abf_PPH4 <- NA_real_
+  }
+  r
+}
+
+########################################################################
+##     -> format_data -> harmonise_data -> mr_keep)
+########################################################################
+run_susie_trait <- function(sleepty, sleep_dat, sleep_type, sleep_N = NULL, sleep_s = NA_real_,
+                            outcome_name = sleepty, har_suffix = sleepty,
+                            window = 500000, out_file = NULL, susie.args = list(),
+                            also_abf = FALSE, sens_threshold = 0.8,
+                            write_details = FALSE) {
+  signif_res <- subset(all_res, all_res$outcome == outcome_name)
+  id <- unique(signif_res$exposure)
+
+  sleep_dat <- sleep_dat[order(sleep_dat$P, decreasing = FALSE), ]
+  sleep_dat <- sleep_dat[!duplicated(sleep_dat$SNP), ]
+
+  if (is.null(sleep_N) || is.na(sleep_N)) {
+    sleep_N <- estimate_N(sleep_dat$BETA, sleep_dat$BETA_SE, sleep_dat$EAF)
+    message(sleepty, ": N was not specified; effective N estimated from beta/se/eaf = ", round(sleep_N))
+  }
+  message(sleepty, ": type = ", sleep_type, ", N = ", round(sleep_N),
+          ", metabolites to test for colocalization = ", length(id))
+
+  rows <- list()
+  rows_detail <- list()
+  for (k in seq_along(id)) {
+    metaboliteid <- id[k]
+    message("  [", k, "/", length(id), "] metabolite ", metaboliteid)
+
+    prep <- tryCatch({
+      metabolite_N <- catalog[catalog$exposure == metaboliteid, ][[2]]
+      if (length(metabolite_N) == 0 || is.na(metabolite_N)) stop("GWAS Catalog is missing N for this metabolite")
+
+      f_met <- paste0(dat_dir, "GCST", metaboliteid, ".tsv.gz")
+      if (!file.exists(f_met)) stop("Metabolite GWAS file not found: ", f_met)
+      metabolite <- fread(f_met)
+      metabolite <- metabolite[order(metabolite$p_value, decreasing = FALSE), ]
+      metabolite <- metabolite[!duplicated(metabolite$variant_id), ]
+      setnames(metabolite, "variant_id", "SNP")
+
+      f_har <- file.path(mr_output_dir, "harmonise_data", paste0(metaboliteid, "_", har_suffix, "_har3.RData"))
+      if (!file.exists(f_har)) stop("Harmonized MR file not found: ", f_har)
+      har_env <- new.env()
+      load(f_har, envir = har_env)
+      if (is.null(har_env$exp_out_har3)) stop("The harmonized file does not contain exp_out_har3")
+      exp_out_har3 <- har_env$exp_out_har3
+      ord <- order(exp_out_har3$pval.exposure, decreasing = FALSE)
+      top_chr <- exp_out_har3$chr.exposure[ord][1]
+      top_bp  <- exp_out_har3$pos.exposure[ord][1]
+
+      met_reg <- subset(metabolite, base_pair_location > top_bp - window &
+                                     base_pair_location < top_bp + window & chromosome == top_chr)
+      slp_reg <- subset(sleep_dat, BP > top_bp - window & BP < top_bp + window & CHR == top_chr)
+
+      input <- merge(slp_reg, met_reg, by = "SNP",
+                     all = FALSE, suffixes = c(".sl", ".mt"))
+
+      metabolite_format <- format_data(input, type = "exposure", snps = NULL, header = TRUE,
+        snp_col = "SNP", chr_col = "chromosome", pos_col = "base_pair_location",
+        effect_allele_col = "effect_allele", other_allele_col = "other_allele",
+        eaf_col = "effect_allele_frequency", beta_col = "beta",
+        se_col = "standard_error", pval_col = "p_value")
+      sleep_format <- format_data(input, type = "outcome", snps = input$SNP, header = TRUE,
+        snp_col = "SNP", chr_col = "CHR", pos_col = "BP",
+        effect_allele_col = "Effect_Allele", other_allele_col = "Other_Allele",
+        eaf_col = "EAF", beta_col = "BETA", se_col = "BETA_SE", pval_col = "P")
+
+      har <- harmonise_data(metabolite_format, sleep_format, action = 2)
+      har <- subset(har, har$mr_keep == TRUE)
+
+      list(har = har, metabolite_N = metabolite_N, top_chr = top_chr, top_bp = top_bp)
+    }, error = function(e) e)
+
+    if (inherits(prep, "error")) {
+      message("    -> Skipped: ", conditionMessage(prep))
+      r <- new_res_row()
+      r$metabolite <- metaboliteid
+      r$sleep      <- sleepty
+      r$status     <- paste0("prep_failed: ", conditionMessage(prep))
+      rows[[length(rows) + 1]] <- r
+      if (write_details) {
+        d <- new_detail_row(with_abf = also_abf)
+        d$metabolite <- metaboliteid
+        d$sleep      <- sleepty
+        d$status     <- paste0("prep_failed: ", conditionMessage(prep))
+        rows_detail[[length(rows_detail) + 1]] <- d
+      }
+      next
+    }
+
+    ## ---- 6.2 coloc.susie ----
+    loc <- run_coloc_susie_locus(prep$har,
+                                 sleep_N = sleep_N, metabolite_N = prep$metabolite_N,
+                                 sleep_type = sleep_type, sleep_s = sleep_s,
+                                 maf_min = ld_maf_min, susie.args = susie.args,
+                                 also_abf = also_abf, sens_threshold = sens_threshold)
+    message("    -> ", loc$status,
+            " (nsnps=", loc$nsnps,
+            ", CS: sleep=", loc$n_cs_sleep, " metabolite=", loc$n_cs_metabolite,
+            ", minP_sleep=", signif(loc$minp_sleep, 2),
+            ", signal pairs=", if (is.null(loc$pairs)) 0L else nrow(loc$pairs), ")")
+
+    base_row <- new_res_row()
+    base_row$metabolite      <- metaboliteid
+    base_row$sleep           <- sleepty
+    base_row$top_chr         <- prep$top_chr
+    base_row$top_bp          <- prep$top_bp
+    base_row$n_cs_sleep      <- loc$n_cs_sleep
+    base_row$n_cs_metabolite <- loc$n_cs_metabolite
+    base_row$nsnps           <- loc$nsnps
+    base_row$status          <- loc$status
+
+    dbase_row <- NULL
+    if (write_details) {
+      dbase_row <- new_detail_row(with_abf = also_abf)
+      dbase_row$metabolite     <- metaboliteid
+      dbase_row$sleep          <- sleepty
+      dbase_row$top_chr        <- prep$top_chr
+      dbase_row$top_bp         <- prep$top_bp
+      dbase_row$nsnps          <- loc$nsnps
+      dbase_row$nsnps_har      <- loc$nsnps_har
+      dbase_row$nsnps_ld       <- loc$nsnps_ld
+      dbase_row$ld_match_rate  <- loc$ld_match_rate
+      dbase_row$n_cs_sleep     <- loc$n_cs_sleep
+      dbase_row$n_cs_metabolite <- loc$n_cs_metabolite
+      dbase_row$minp_sleep     <- loc$minp_sleep
+      dbase_row$converged_sleep      <- loc$converged_sleep
+      dbase_row$converged_metabolite <- loc$converged_metabolite
+      dbase_row$status         <- loc$status
+      if (also_abf && !is.null(loc$abf_summary)) {
+        dbase_row$abf_nsnps <- loc$abf_summary$nsnps[1]
+        dbase_row$abf_PPH0  <- loc$abf_summary$PP.H0.abf[1]
+        dbase_row$abf_PPH1  <- loc$abf_summary$PP.H1.abf[1]
+        dbase_row$abf_PPH2  <- loc$abf_summary$PP.H2.abf[1]
+        dbase_row$abf_PPH3  <- loc$abf_summary$PP.H3.abf[1]
+        dbase_row$abf_PPH4  <- loc$abf_summary$PP.H4.abf[1]
+      }
+    }
+
+    if (is.null(loc$pairs) || nrow(loc$pairs) == 0) {
+      rows[[length(rows) + 1]] <- base_row
+      if (!is.null(dbase_row)) rows_detail[[length(rows_detail) + 1]] <- dbase_row
+    } else {
+      for (p in seq_len(nrow(loc$pairs))) {
+        r <- base_row
+        for (cn in names(loc$pairs)) r[[cn]] <- loc$pairs[[cn]][p]
+        rows[[length(rows) + 1]] <- r
+        if (!is.null(dbase_row) && !is.null(loc$pairs_detail)) {
+          d <- dbase_row
+          for (cn in names(loc$pairs_detail)) d[[cn]] <- loc$pairs_detail[[cn]][p]
+          rows_detail[[length(rows_detail) + 1]] <- d
+        }
+      }
+    }
+
+    if (k %% 20 == 0) gc()
+  }
+
+  res_tab <- do.call(rbind, rows)
+  if (!is.null(out_file)) save_table(res_tab, out_file)
+  if (write_details && !is.null(out_file) && length(rows_detail) > 0) {
+    detail_file <- sub("_res\\.(csv|xlsx)$", "_details.xlsx", out_file)
+    save_table(do.call(rbind, rows_detail), detail_file)
+  }
+  res_tab
+}
+
+## Collect and combine results across sleep traits
+coloc_susie_list <- list()
+```
+
+**Analysis block.** Long sleep duration.
+
+```{r coloc-03-06-long-sleep-duration}
+# Source file: 3_colocalization_susie_localLD_500kb.Rmd
+load(file.path(sleep_gwas_dir, "30846698", "long_sleep_duration_unadjBMI_UKB_2019_allSNP_hg38.RData"))
+longsleepduration <- get("dat_allSNP_hg38")
+rm(dat_allSNP_hg38)
+
+# Cases: 34,184; controls: 305,742 (Dashti et al. 2019)
+coloc_susie_list$longsleepduration <- run_susie_trait(
+  sleepty      = "longsleepduration",
+  sleep_dat    = longsleepduration,
+  sleep_type   = "cc",
+  sleep_N      = 34184 + 305742,
+  sleep_s      = 34184/(34184 + 305742),
+  out_file     = file.path(file_dir, paste0("metabolite_longsleepduration_colocalization_500kb_susie_res.xlsx")))
+
+rm(longsleepduration)
+```
+
+**Analysis block.** Short sleep duration.
+
+```{r coloc-03-07-short-sleep-duration}
+# Source file: 3_colocalization_susie_localLD_500kb.Rmd
+load(file.path(sleep_gwas_dir, "30846698", "short_sleep_duration_unadjBMI_UKB_2019_allSNP_hg38.RData"))
+shortsleepduration <- get("dat_allSNP_hg38")
+rm(dat_allSNP_hg38)
+
+# Cases: 106,192; controls: 305,742 (Dashti et al. 2019)
+coloc_susie_list$shortsleepduration <- run_susie_trait(
+  sleepty      = "shortsleepduration",
+  sleep_dat    = shortsleepduration,
+  sleep_type   = "cc",
+  sleep_N      = 106192 + 305742,
+  sleep_s      = 106192/(106192 + 305742),
+  out_file     = file.path(file_dir, paste0("metabolite_shortsleepduration_colocalization_500kb_susie_res.xlsx")))
+
+rm(shortsleepduration)
+```
+
+**Analysis block.** Insomnia.
+
+```{r coloc-03-08-insomnia}
+# Source file: 3_colocalization_susie_localLD_500kb.Rmd
+load(file.path(sleep_gwas_dir, "30804566", "insomnia_unadjBMI_UKB_2019_allSNP_hg38.RData"))
+insomnia <- get("dat_allSNP_hg38")
+rm(dat_allSNP_hg38)
+
+coloc_susie_list$insomnia <- run_susie_trait(
+  sleepty      = "insomnia",
+  sleep_dat    = insomnia,
+  sleep_type   = "cc",
+  sleep_N      = 345022+108357,
+  sleep_s      = 345022/(345022+108357),
+  out_file     = file.path(file_dir, paste0("metabolite_insomnia_colocalization_500kb_susie_res.xlsx")))
+
+rm(insomnia)
+```
+
+**Analysis block.** Morning person.
+
+```{r coloc-03-09-morning-person}
+# Source file: 3_colocalization_susie_localLD_500kb.Rmd
+load(file.path(sleep_gwas_dir, "30696823", "morning_person_unadjBMI_UKB_2019_allSNP_hg38.RData"))
+morning_person <- get("dat_allSNP_hg38")
+rm(dat_allSNP_hg38)
+
+# Cases: 252,287; total N: 403,195 (Jones et al. 2019)
+coloc_susie_list$morning_person <- run_susie_trait(
+  sleepty      = "morning_person",
+  sleep_dat    = morning_person,
+  sleep_type   = "cc",
+  sleep_N      = 403195,
+  sleep_s      = 252287/403195,
+  out_file     = file.path(file_dir, paste0("metabolite_morning_person_colocalization_500kb_susie_res.xlsx")))
+
+rm(morning_person)
+```
+
+**Analysis block.** Snoring adjusted for BMI.
+
+```{r coloc-03-10-snoring-adj-bmi}
+# Source file: 3_colocalization_susie_localLD_500kb.Rmd
+load(file.path(sleep_gwas_dir, "32060260", "snoring_adjBMI_UKB_2018_allSNP_hg38.RData"))
+snoring_adjBMI <- get("dat_allSNP_hg38")
+rm(dat_allSNP_hg38)
+
+# Note: this trait is labelled "snoringadjBMI", and the harmonise-file suffix is also "snoringadjBMI"
+coloc_susie_list$snoring_adjBMI <- run_susie_trait(
+  sleepty      = "snoring_adjBMI",
+  outcome_name = "snoringadjBMI",
+  har_suffix   = "snoringadjBMI",
+  sleep_dat    = snoring_adjBMI,
+  sleep_type   = "cc",
+  sleep_N      = 407066,
+  sleep_s      = 151836/407066,
+  out_file     = file.path(file_dir, paste0("metabolite_snoring_adjBMI_colocalization_500kb_susie_res.xlsx")))
+
+rm(snoring_adjBMI)
+```
+
+**Analysis block.** Obstructive sleep apnoea.
+
+```{r coloc-03-11-osa}
+# Source file: 3_colocalization_susie_localLD_500kb.Rmd
+load(file.path(sleep_gwas_dir, "OSA", "OSA_R5_allSNP_hg38.RData"))
+OSA <- subset(OSA, OSA$EAF<1)
+
+# No reliable N is available; effective N is estimated from summary statistics(local estimate approximately1.3e4)
+coloc_susie_list$OSA <- run_susie_trait(
+  sleepty      = "OSA",
+  sleep_dat    = OSA,
+  sleep_type   = "cc",
+  sleep_N      = 217955,
+  sleep_s      = 16761/217955,
+  out_file     = file.path(file_dir, paste0("metabolite_OSA_colocalization_500kb_susie_res.xlsx")))
+
+rm(OSA)
+```
+
+**Analysis block.** Daytime sleepiness adjusted for BMI.
+
+```{r coloc-03-12-daytime-sleepiness}
+# Source file: 3_colocalization_susie_localLD_500kb.Rmd
+load(file.path(sleep_gwas_dir, "31409809", "daytime_sleepiness_adjBMI_UKB_2019_allSNP_hg38.RData"))
+daytimesleepiness_adjBMI <- get("dat_allSNP_hg38")
+rm(dat_allSNP_hg38)
+
+coloc_susie_list$daytimesleepiness_adjBMI <- run_susie_trait(
+  sleepty      = "daytimesleepiness_adjBMI",
+  sleep_dat    = daytimesleepiness_adjBMI,
+  sleep_type   = "quant",
+  sleep_N      = 452071,
+  out_file     = file.path(file_dir, paste0("metabolite_daytimesleepiness_adjBMI_colocalization_500kb_susie_res.xlsx")))
+
+rm(daytimesleepiness_adjBMI)
+```
+
+**Analysis block.** Chronotype.
+
+```{r coloc-03-13-chronotype}
+# Source file: 3_colocalization_susie_localLD_500kb.Rmd
+load(file.path(sleep_gwas_dir, "30696823", "chronotype_unadjBMI_UKB_2019_allSNP_hg38.RData"))
+chronotype <- get("dat_allSNP_hg38")
+rm(dat_allSNP_hg38)
+
+coloc_susie_list$chronotype <- run_susie_trait(
+  sleepty      = "chronotype",
+  sleep_dat    = chronotype,
+  sleep_type   = "quant",
+  sleep_N      = 449734,
+  out_file     = file.path(file_dir, paste0("metabolite_chronotype_colocalization_500kb_susie_res.xlsx")))
+
+rm(chronotype)
+```
+
+**Analysis block.** Sleep duration.
+
+```{r coloc-03-14-sleep-duration}
+# Source file: 3_colocalization_susie_localLD_500kb.Rmd
+load(file.path(sleep_gwas_dir, "30846698", "sleep_duration_unadjBMI_UKB_2019_allSNP_hg38.RData"))
+sleepduration <- get("dat_allSNP_hg38")
+rm(dat_allSNP_hg38)
+
+coloc_susie_list$sleepduration <- run_susie_trait(
+  sleepty      = "sleepduration",
+  sleep_dat    = sleepduration,
+  sleep_type   = "quant",
+  sleep_N      = 446118,
+  out_file     = file.path(file_dir, paste0("metabolite_sleepduration_colocalization_500kb_susie_res.xlsx")))
+
+rm(sleepduration)
+```
+
+**Analysis block.** Napping.
+
+```{r coloc-03-15-napping}
+# Source file: 3_colocalization_susie_localLD_500kb.Rmd
+load(file.path(sleep_gwas_dir, "33568662", "daytime_napping_unadjBMI_UKB_2021_allSNP_hg38.RData"))
+napping <- get("dat_allSNP_hg38")
+rm(dat_allSNP_hg38)
+
+coloc_susie_list$napping <- run_susie_trait(
+  sleepty      = "napping",
+  sleep_dat    = napping,
+  sleep_type   = "quant",
+  sleep_N      = 452633,
+  out_file     = file.path(file_dir, paste0("metabolite_napping_colocalization_500kb_susie_res.xlsx")))
+
+rm(napping)
+```
+
+**Analysis block.** Combine signal-pair results.
+
+```{r coloc-03-16-combine-results}
+# Source file: 3_colocalization_susie_localLD_500kb.Rmd
+coloc_susie_all <- do.call(rbind, coloc_susie_list)
+
+save_table(coloc_susie_all,
+           file.path(file_dir, paste0("metabolite_sleep_colocalization_500kb_susie_allpairs.xlsx")))
+
+ok <- coloc_susie_all[!is.na(coloc_susie_all$PP.H4.abf), ]
+if (nrow(ok) > 0) {
+  key <- paste(ok$sleep, ok$metabolite, sep = "_")
+  best <- do.call(rbind, lapply(split(ok, key), function(x) x[which.max(x$PP.H4.abf), ]))
+  rownames(best) <- NULL
+  save_table(best,
+             file.path(file_dir, paste0("metabolite_sleep_colocalization_500kb_susie_bestpair.xlsx")))
+}
+```
+
+## 4. LD-based overlap and clustering of lipid instruments
+
+For two lipids with m and n instruments, the LD-based Jaccard index is the number of instrument pairs with r² above the threshold divided by m × n. The resulting distance matrix, `1 - Jaccard`, is used for hierarchical clustering.
+
+**Chunk purpose.** Load the packages used for overlap calculation and plotting.
+
+```{r coloc-04-01-dependencies}
+# Source file: 4_LDoverlap_Jaccard.R
+## 0. Dependencies
+pkgs <- c("readxl", "openxlsx", "pheatmap", "ggplot2")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    stop(sprintf("Please install R package '%s' with install.packages('%s')", p, p))
+  }
+}
+suppressPackageStartupMessages({
+  library(readxl); library(openxlsx); library(pheatmap); library(ggplot2)
+})
+```
+
+**Chunk purpose.** Define the IV table, LD reference, and output directories.
+
+```{r coloc-04-02-path-configuration}
+# Source file: 4_LDoverlap_Jaccard.R
+## 1. Path configuration
+base_dir <- coloc_output_dir
+cmd_args <- commandArgs(trailingOnly = TRUE)
+if (length(cmd_args) >= 1) base_dir <- cmd_args[1]
+
+iv_file     <- file.path(reference_dir, "Ivs_LipidSleepDur.xlsx")
+out_dir     <- file.path(base_dir, "LDOverlap")
+plink_bfile <- ld_bfile
+
+LD_THRESHOLD <- 0.6
+CLUSTER_METHOD <- "ward.D2"
+K_RANGE        <- 2:20
+MIN_GOOD_SIZE  <- 2
+MAX_GOOD_SIZE  <- 10
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+if (!file.exists(iv_file)) stop("File not found: ", iv_file)
+if (!file.exists(paste0(plink_bfile, ".bed"))) stop("LD reference panel not found: ", plink_bfile)
+```
+
+**Chunk purpose.** Read and validate the lipid instrument-variable list.
+
+```{r coloc-04-03-read-iv-list}
+# Source file: 4_LDoverlap_Jaccard.R
+## 2. Read the IV list
+iv <- as.data.frame(read_excel(iv_file, sheet = 1))
+need <- c("SNP", "exposure")
+if (length(setdiff(need, colnames(iv))) > 0)
+  stop("The IV table is missing columns: ", paste(setdiff(need, colnames(iv)), collapse = ", "))
+iv <- iv[!is.na(iv$SNP) & !is.na(iv$exposure), c("SNP", "exposure")]
+iv$SNP      <- trimws(iv$SNP)
+iv$exposure <- trimws(iv$exposure)
+iv <- unique(iv)
+
+lipids  <- sort(unique(iv$exposure))
+iv_list <- lapply(lipids, function(x) sort(unique(iv$SNP[iv$exposure == x])))
+names(iv_list) <- lipids
+snps    <- sort(unique(iv$SNP))
+
+cat("Lipid metabolites:", length(lipids), "; instruments (SNPs):", length(snps),
+    "; IV records:", nrow(iv), "\n")
+```
+
+**Chunk purpose.** Call PLINK to calculate the pairwise r-squared matrix.
+
+```{r coloc-04-04-calculate-ld}
+# Source file: 4_LDoverlap_Jaccard.R
+## 3. Calculate LD with PLINK
+plink_exe <- NULL
+if (requireNamespace("plinkbinr", quietly = TRUE)) {
+  plink_exe <- tryCatch(plinkbinr::get_plink_exe(), error = function(e) NULL)
+}
+if (is.null(plink_exe) || !file.exists(plink_exe)) plink_exe <- Sys.which("plink")
+if (is.null(plink_exe) || plink_exe == "")
+  stop("PLINK was not found. Install plinkbinr or add PLINK to PATH.")
+cat("Using PLINK:", plink_exe, "\n")
+
+snplist_file <- file.path(out_dir, "iv_snps.txt")
+writeLines(snps, snplist_file)
+ld_prefix <- file.path(out_dir, "eur_iv")
+
+plink_args <- c(paste0("--bfile ", shQuote(plink_bfile)),
+                paste0("--extract ", shQuote(snplist_file)),
+                "--r2 square", "--write-snplist", "--allow-no-sex",
+                paste0("--out ", shQuote(ld_prefix)))
+plink_log <- system2(plink_exe, args = plink_args, stdout = TRUE, stderr = TRUE)
+writeLines(plink_log, file.path(out_dir, "eur_iv.plink.log"))
+
+kept_snps    <- trimws(readLines(paste0(ld_prefix, ".snplist")))
+missing_snps <- setdiff(snps, kept_snps)
+cat("SNPs found in the reference panel:", length(kept_snps), "/", length(snps), "\n")
+if (length(missing_snps) > 0)
+  cat("Warning: the following SNPs are absent from the reference panel; LD is set to 0:\n  ",
+      paste(missing_snps, collapse = ", "), "\n")
+
+## 4. Read and label the r-squared matrix
+ld_mat <- as.matrix(read.table(paste0(ld_prefix, ".ld"), header = FALSE))
+if (length(kept_snps) != nrow(ld_mat))
+  stop("The LD-matrix dimensions do not match the SNP list; check the PLINK output.")
+dimnames(ld_mat) <- list(kept_snps, kept_snps)
+diag(ld_mat) <- 1
+ld_mat[is.na(ld_mat)] <- 0
+```
+
+**Chunk purpose.** Calculate LD-based Jaccard overlap for every pair of lipids.
+
+```{r coloc-04-05-pairwise-jaccard}
+# Source file: 4_LDoverlap_Jaccard.R
+## 5. Pairwise Jaccard overlap between lipids
+pairwise_jaccard <- function(a, b, ld, thr) {
+  a <- intersect(a, rownames(ld))
+  b <- intersect(b, rownames(ld))
+  m <- length(a); n <- length(b)
+  if (m == 0 || n == 0)
+    return(list(J = NA_real_, n_hit = NA_integer_, m = m, n = n,
+                n_same = NA_integer_, maxLD = NA_real_))
+  sub   <- ld[a, b, drop = FALSE]
+  n_hit <- sum(sub > thr)
+  list(J = n_hit / (m * n), n_hit = n_hit, m = m, n = n,
+       n_same = length(intersect(a, b)), maxLD = max(sub, na.rm = TRUE))
+}
+
+J    <- matrix(NA_real_, length(lipids), length(lipids),
+               dimnames = list(lipids, lipids))
+long <- list()
+for (i in seq_along(lipids)) {
+  for (j in seq_along(lipids)) {
+    r <- pairwise_jaccard(iv_list[[i]], iv_list[[j]], ld_mat, LD_THRESHOLD)
+    J[i, j] <- r$J
+    if (i <= j) {
+      long[[length(long) + 1]] <- data.frame(
+        Lipid_A              = lipids[i],
+        Lipid_B              = lipids[j],
+        n_IV_A               = r$m,
+        n_IV_B               = r$n,
+        n_IV_pairs           = r$m * r$n,
+        n_pairs_LD_gt_thr    = r$n_hit,
+        n_shared_IV_same_SNP = r$n_same,
+        max_LD_r2            = r$maxLD,
+        LD_threshold         = LD_THRESHOLD,
+        Jaccard_LD           = r$J,
+        stringsAsFactors     = FALSE)
+    }
+  }
+}
+long_df <- do.call(rbind, long)
+rownames(long_df) <- NULL
+```
+
+**Chunk purpose.** Cluster lipids using distance 1 - Jaccard and select the cluster count.
+
+```{r coloc-04-06-hierarchical-clustering}
+# Source file: 4_LDoverlap_Jaccard.R
+D  <- as.dist(1 - J)
+hc <- hclust(D, method = CLUSTER_METHOD)
+
+ks      <- K_RANGE[K_RANGE < length(lipids)]
+sel_tbl <- do.call(rbind, lapply(ks, function(k) {
+  g  <- cutree(hc, k = k)
+  sz <- as.integer(table(g))
+  n_good <- sum(sz[sz >= MIN_GOOD_SIZE & sz <= MAX_GOOD_SIZE])
+  data.frame(k = k, n_cluster = length(sz), min_size = min(sz), max_size = max(sz),
+             n_singletons = sum(sz == 1),
+             n_in_good_clusters = n_good,
+             n_outside_good = length(lipids) - n_good,
+             mean_silhouette = round(mean(cluster::silhouette(g, D)[, 3]), 4),
+             sizes = paste(sort(sz, decreasing = TRUE), collapse = ","))
+}))
+ord   <- order(sel_tbl$n_outside_good, -sel_tbl$mean_silhouette)
+k_use <- sel_tbl$k[ord[1]]
+
+linkage_cmp <- do.call(rbind, lapply(
+  c("ward.D2", "average", "complete", "single", "mcquitty"), function(m) {
+    h <- hclust(D, method = m)
+    tt <- do.call(rbind, lapply(ks, function(k) {
+      g  <- cutree(h, k = k); sz <- as.integer(table(g))
+      n_good <- sum(sz[sz >= MIN_GOOD_SIZE & sz <= MAX_GOOD_SIZE])
+      data.frame(k = k, n_outside_good = length(lipids) - n_good,
+                 mean_silhouette = mean(cluster::silhouette(g, D)[, 3]))
+    }))
+    b  <- tt[order(tt$n_outside_good, -tt$mean_silhouette)[1], ]
+    data.frame(linkage = m, best_k = b$k,
+               n_metabolites_outside_good_clusters = b$n_outside_good,
+               best_mean_silhouette = round(b$mean_silhouette, 4),
+               size_distribution = paste(sort(as.integer(table(cutree(h, k = b$k))),
+                                              decreasing = TRUE), collapse = ","),
+               stringsAsFactors = FALSE)
+  }))
+
+cl_raw  <- cutree(hc, k = k_use)
+cl_rank <- as.integer(names(sort(table(cl_raw), decreasing = TRUE)))
+grp_lab <- factor(paste0("C", match(as.integer(cl_raw), cl_rank)),
+                  levels = paste0("C", seq_len(k_use)))
+names(grp_lab) <- rownames(J)
+grp_lab <- grp_lab[lipids]
+
+cat("\nClustering:", CLUSTER_METHOD, "linkage; under the cluster-size range", MIN_GOOD_SIZE, "-", MAX_GOOD_SIZE,
+    "the selected k =", k_use,
+    "(cluster sizes", sel_tbl$sizes[sel_tbl$k == k_use],
+    "; mean silhouette width", sel_tbl$mean_silhouette[sel_tbl$k == k_use], ")\n")
+
+cluster_df <- data.frame(
+  Lipid        = lipids,
+  Cluster      = as.character(grp_lab),
+  Cluster_size = as.integer(table(grp_lab)[as.character(grp_lab)]),
+  n_IV         = as.integer(sapply(iv_list, length)),
+  mean_Jaccard = round(rowMeans(J, na.rm = TRUE), 3),
+  silhouette   = round(cluster::silhouette(as.integer(cl_raw), D)[, 3], 3),
+  stringsAsFactors = FALSE)
+cluster_df$Heatmap_order <- match(lipids, lipids[hc$order])
+cluster_df <- cluster_df[order(as.integer(factor(cluster_df$Cluster,
+                                                 levels = levels(grp_lab))),
+                               -cluster_df$mean_Jaccard), ]
+rownames(cluster_df) <- NULL
+
+group_members <- do.call(rbind, lapply(levels(grp_lab), function(cc) {
+  m <- lipids[as.character(grp_lab) == cc]
+  data.frame(Cluster = cc, n = length(m),
+             Members = paste(m, collapse = " | "),
+             IVs = paste(sort(unique(unlist(iv_list[m]))), collapse = ", "),
+             stringsAsFactors = FALSE)
+}))
+rownames(group_members) <- NULL
+
+off_diag <- J[lower.tri(J)]
+cat("\nOff-diagonal Jaccard distribution: minimum", round(min(off_diag), 3),
+    "; median", round(median(off_diag), 3),
+    "; maximum", round(max(off_diag), 3), "\n")
+```
+
+**Chunk purpose.** Write matrices, clustering tables, IVs, and the Excel workbook.
+
+```{r coloc-04-07-write-results}
+# Source file: 4_LDoverlap_Jaccard.R
+## 6. Output
+stamp <- ""
+
+write.csv(J, file.path(out_dir, paste0("LDoverlap_Jaccard_matrix.csv")),
+          fileEncoding = "UTF-8")
+write.csv(long_df, file.path(out_dir, paste0("LDoverlap_pairwise_long.csv")),
+          row.names = FALSE, fileEncoding = "UTF-8")
+
+iv_table <- data.frame(Lipid = rep(lipids, sapply(iv_list, length)),
+                       SNP   = unlist(iv_list),
+                       stringsAsFactors = FALSE)
+iv_table <- iv_table[order(iv_table$Lipid, iv_table$SNP), ]
+rownames(iv_table) <- NULL
+
+overview <- data.frame(
+  Item = c("Input IV file", "Number of lipid metabolites", "Number of unique IVs",
+           "Number of IV records", "Reference panel", "LD measure", "LD threshold",
+           "SNPs found in reference", "SNPs missing from reference",
+           "Jaccard definition"),
+  Value = c(basename(iv_file), length(lipids), length(snps), nrow(iv),
+            plink_bfile, "r^2 (PLINK --r2 square)", LD_THRESHOLD,
+            length(kept_snps), paste(missing_snps, collapse = ", "),
+            "n(IV pairs with r2 > threshold) / n(all IV pairs)"),
+  stringsAsFactors = FALSE)
+
+wb_list <- list("0_Overview"    = overview,
+                "Jaccard matrix" = data.frame(Lipid = rownames(J), J,
+                                              check.names = FALSE),
+                "Pairwise long"  = long_df,
+                "Cluster groups" = group_members,
+                "Cluster table"  = cluster_df,
+                "Cluster selection" = sel_tbl,
+                "Linkage compare" = linkage_cmp,
+                "LD matrix (r2)" = data.frame(SNP = rownames(ld_mat), ld_mat,
+                                              check.names = FALSE),
+                "IV list"        = iv_table)
+
+wb <- createWorkbook()
+for (sn in names(wb_list)) {
+  addWorksheet(wb, sn)
+  writeData(wb, sn, wb_list[[sn]])
+  freezePane(wb, sn, firstRow = TRUE)
+  setColWidths(wb, sn, cols = seq_len(ncol(wb_list[[sn]])), widths = "auto")
+}
+notes <- data.frame(Note = c(
+  "LD-based overlap of instrumental variables between lipid metabolites associated with sleep duration",
+  "For lipid A (m IVs) and lipid B (n IVs): Jaccard = n(IV pairs with LD r2 > threshold) / (m * n)",
+  paste0("LD reference panel: ", plink_bfile,
+         " (1000 Genomes phase 3, European; 503 individuals)"),
+  paste0("LD measure: r^2 computed by PLINK 1.9 (--r2 square); threshold = ", LD_THRESHOLD),
+  "Diagonal = within-lipid overlap (fraction of a lipid's own IV pairs with r2 > threshold); equals 1 when the lipid has a single IV",
+  paste0("Clustering: hierarchical clustering (", CLUSTER_METHOD,
+         " linkage) on the distance 1 - Jaccard; no additional distance measure is introduced"),
+  paste0("Number of clusters: k = ", k_use,
+         ", selected so that as many metabolites as possible fall in a cluster of ",
+         MIN_GOOD_SIZE, "-", MAX_GOOD_SIZE,
+         " members (suitable for multi-trait colocalization); ties broken by the highest mean silhouette width"),
+  paste0("At the selected k: cluster sizes = ", sel_tbl$sizes[sel_tbl$k == k_use],
+         "; metabolites outside the ", MIN_GOOD_SIZE, "-", MAX_GOOD_SIZE,
+         " range = ", sel_tbl$n_outside_good[sel_tbl$k == k_use],
+         "; mean silhouette = ", sel_tbl$mean_silhouette[sel_tbl$k == k_use]),
+  "'Cluster selection' lists, for every k, the number of clusters, cluster sizes, the number of metabolites in 2-10-member clusters and the mean silhouette width",
+  "'Linkage compare' applies the same selection rule to ward.D2 / average / complete / single / mcquitty",
+  "Clusters are labelled C1, C2, ... in decreasing size",
+  "IMPORTANT: 11 single-IV metabolites all carry SNPs in the FADS1/FADS2 region (rs174546, rs174560, rs102275, rs99780, rs4246215, rs174533, rs174556, rs174535) that are mutually in r2 > 0.6; their pairwise Jaccard is exactly 1, so no LD-based clustering can split them into smaller groups",
+  "IVs absent from the reference panel are treated as having no LD with any other IV",
+  "Method: LD-based Jaccard overlap and hierarchical clustering"
+))
+addWorksheet(wb, "Methods")
+writeData(wb, "Methods", notes)
+setColWidths(wb, "Methods", cols = 1, widths = 150)
+
+can_write <- function(p) {
+  if (!file.exists(p)) return(TRUE)
+  con <- try(file(p, "r+b"), silent = TRUE)
+  if (inherits(con, "try-error")) return(FALSE)
+  close(con); TRUE
+}
+xlsx_out <- file.path(out_dir, paste0("LDoverlap_results.xlsx"))
+if (!can_write(xlsx_out))
+  xlsx_out <- sub("\\.xlsx$", format(Sys.time(), "_%H%M%S.xlsx"), xlsx_out)
+saveWorkbook(wb, xlsx_out, overwrite = TRUE)
+cat("\nWritten: ", xlsx_out, "\n")
+```
+
+**Chunk purpose.** Draw the annotated clustering heatmap and the cluster-count diagnostic plot.
+
+## 5. Multi-trait HyPrColoc by lipid cluster and sleep-duration trait
+
+Each cluster is tested with its metabolites together with sleep duration, long sleep duration, and short sleep duration. The analysis extracts the cluster's most instrument-rich hg38 locus, aligns effect alleles, runs HyPrColoc, and reports credible sets and sensitivity results.
+
+**Chunk purpose.** Load HyPrColoc and the input/output libraries.
+
+```{r coloc-05-01-dependencies}
+# Source file: 5_HyPrColoc_cluster_sleep_duration.R
+## 0. Dependencies
+pkgs <- c("readxl", "openxlsx", "data.table", "hyprcoloc")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    stop(sprintf("Please install R package '%s'. HyPrColoc can be installed with remotes::install_github('jrs95/hyprcoloc').", p))
+  }
+}
+suppressPackageStartupMessages({
+  library(readxl); library(openxlsx); library(data.table); library(hyprcoloc)
+})
+cat("HyPrColoc (hyprcoloc) version:", as.character(packageVersion("hyprcoloc")), "\n")
+```
+
+**Chunk purpose.** Define cluster, metabolite, sleep-GWAS, and output paths plus analysis parameters.
+
+```{r coloc-05-02-path-configuration}
+# Source file: 5_HyPrColoc_cluster_sleep_duration.R
+## 1. Paths and parameters
+base_dir <- coloc_output_dir
+cmd_args <- commandArgs(trailingOnly = TRUE)
+if (length(cmd_args) >= 1) base_dir <- cmd_args[1]
+
+out_dir   <- file.path(base_dir, "HyPrColoc")
+cache_dir <- file.path(out_dir, "cache")
+dir.create(out_dir,   showWarnings = FALSE, recursive = TRUE)
+dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
+
+cluster_file <- file.path(base_dir, "LDOverlap", "LDoverlap_results.xlsx")
+sig_file     <- file.path(reference_dir, "MR_Significant_MetaboliteSleep.xlsx")
+iv_file      <- file.path(reference_dir, "Ivs_LipidSleepDur.xlsx")
+meta_dir     <- metabolite_gwas_dir
+sleep_dir    <- file.path(sleep_gwas_dir, "30846698")
+
+sleep_files <- c(
+  "Sleep duration"       = file.path(sleep_dir, "sleep_duration_unadjBMI_UKB_2019_allSNP_hg38.RData"),
+  "Long sleep duration"  = file.path(sleep_dir, "long_sleep_duration_unadjBMI_UKB_2019_allSNP_hg38.RData"),
+  "Short sleep duration" = file.path(sleep_dir, "short_sleep_duration_unadjBMI_UKB_2019_allSNP_hg38.RData")
+)
+
+WINDOW_KB   <- 500
+LOCUS_GAP   <- 1e6
+MIN_SNP_KEEP <- 5
+RUN_SENSITIVITY <- TRUE
+```
+
+**Chunk purpose.** Read the LD-overlap clusters and map metabolites to GWAS Catalog and HMDB identifiers.
+
+```{r coloc-05-03-cluster-metadata}
+# Source file: 5_HyPrColoc_cluster_sleep_duration.R
+## 2. Cluster members and metabolite/HMDB identifiers
+clu <- as.data.frame(read_excel(cluster_file, sheet = "Cluster groups"))
+sig <- as.data.frame(read_excel(sig_file, sheet = 1))
+sig <- sig[!is.na(sig$Exposure), ]
+sig_map <- unique(sig[, c("Exposure", "Metabolite ID", "HMDB ID")])
+names(sig_map) <- c("Exposure", "GCST", "HMDB")
+
+clusters <- lapply(seq_len(nrow(clu)), function(i)
+  list(id = clu$Cluster[i], members = trimws(strsplit(clu$Members[i], "\\|")[[1]])))
+names(clusters) <- clu$Cluster
+
+meta_info <- do.call(rbind, lapply(clusters, function(cl) {
+  idx <- match(cl$members, sig_map$Exposure)
+  data.frame(Cluster = cl$id, Exposure = cl$members,
+             GCST = sig_map$GCST[idx], HMDB = sig_map$HMDB[idx],
+             gw_file = file.path(meta_dir, paste0("GCST", sig_map$GCST[idx], ".tsv.gz")),
+             stringsAsFactors = FALSE)
+}))
+rownames(meta_info) <- NULL
+if (any(is.na(meta_info$GCST))) stop("One or more metabolites could not be mapped to a Metabolite ID")
+miss_file <- meta_info$gw_file[!file.exists(meta_info$gw_file)]
+if (length(miss_file)) stop("Metabolite GWAS files not found:\n", paste(miss_file, collapse = "\n"))
+cat("Clusters:", length(clusters), "; metabolites:", length(unique(meta_info$Exposure)), "\n")
+```
+
+**Chunk purpose.** Assign a core locus and analysis region to each cluster from hg38 IV positions.
+
+```{r coloc-05-04-cluster-loci}
+# Source file: 5_HyPrColoc_cluster_sleep_duration.R
+## 3. Locus region for each cluster based on hg38 IV positions
+ivs <- as.data.frame(read_excel(iv_file, sheet = 1))
+
+pos_cache <- file.path(cache_dir, "iv_positions_hg38.rds")
+if (file.exists(pos_cache)) {
+  iv_pos <- readRDS(pos_cache)
+} else {
+  cat("Read sleep GWAS (hg38) to obtain IV positions ...\n")
+  e <- new.env(); load(sleep_files[["Sleep duration"]], envir = e)
+  d <- get(ls(e)[1], envir = e)
+  iv_pos <- unique(as.data.frame(d[d$SNP %in% unique(ivs$SNP),
+                                    c("SNP", "CHR", "BP")]))
+  rm(d, e); gc()
+  saveRDS(iv_pos, pos_cache)
+}
+
+cluster_region <- do.call(rbind, lapply(clusters, function(cl) {
+  ss <- unique(ivs$SNP[ivs$exposure %in% cl$members])
+  p  <- iv_pos[iv_pos$SNP %in% ss, ]
+  p  <- p[order(p$CHR, p$BP), ]
+  grp <- integer(nrow(p)); g <- 0L
+  for (i in seq_len(nrow(p))) {
+    if (i == 1 || p$CHR[i] != p$CHR[i-1] || p$BP[i] - p$BP[i-1] > LOCUS_GAP) g <- g + 1L
+    grp[i] <- g
+  }
+  best <- which.max(tabulate(grp))
+  q <- p[grp == best, ]
+  data.frame(Cluster = cl$id, CHR = q$CHR[1],
+             start = max(1, min(q$BP) - WINDOW_KB * 1000),
+             end   = max(q$BP) + WINDOW_KB * 1000,
+             n_IV_in_locus = nrow(q),
+             lead_snp = q$SNP[which.min(q$BP)],
+             IVs_in_locus = paste(q$SNP, collapse = ", "),
+             stringsAsFactors = FALSE)
+}))
+rownames(cluster_region) <- NULL
+cat("\nLocus region used for each cluster:\n"); print(cluster_region[, c("Cluster","CHR","start","end","n_IV_in_locus")], row.names = FALSE)
+```
+
+**Chunk purpose.** Extract the relevant regional summary statistics, using a cache when available.
+
+```{r coloc-05-05-regional-extraction}
+# Source file: 5_HyPrColoc_cluster_sleep_duration.R
+## 4. Regional extraction with caching
+extract_from_sleep <- function(d, reg) {
+  x <- d[d$CHR == reg$CHR & d$BP >= reg$start & d$BP <= reg$end,
+         c("SNP", "CHR", "BP", "Effect_Allele", "Other_Allele", "BETA", "BETA_SE")]
+  data.frame(key = paste0(x$CHR, ":", x$BP), SNP = as.character(x$SNP),
+             CHR = x$CHR, BP = x$BP,
+             EA = toupper(x$Effect_Allele), OA = toupper(x$Other_Allele),
+             beta = as.numeric(x$BETA), se = as.numeric(x$BETA_SE),
+             stringsAsFactors = FALSE)
+}
+
+extract_from_meta <- function(d, reg) {
+  x <- d[chromosome == reg$CHR & base_pair_location >= reg$start &
+           base_pair_location <= reg$end,
+         c("chromosome", "base_pair_location", "variant_id",
+           "effect_allele", "other_allele", "beta", "standard_error")]
+  data.frame(key = paste0(x$chromosome, ":", x$base_pair_location),
+             SNP = as.character(x$variant_id),
+             CHR = x$chromosome, BP = x$base_pair_location,
+             EA = toupper(x$effect_allele), OA = toupper(x$other_allele),
+             beta = as.numeric(x$beta), se = as.numeric(x$standard_error),
+             stringsAsFactors = FALSE)
+}
+
+for (tr in names(sleep_files)) {
+  cf <- file.path(cache_dir, paste0("sleep_", gsub("[^A-Za-z]+", "_", tr), ".rds"))
+  if (file.exists(cf)) { cat("Cache hit:", basename(cf), "\n"); next }
+  cat("Reading sleep GWAS:", tr, "...\n")
+  e <- new.env(); load(sleep_files[[tr]], envir = e)
+  d <- get(ls(e)[1], envir = e); rm(e)
+  out <- lapply(seq_len(nrow(cluster_region)), function(i)
+    extract_from_sleep(d, cluster_region[i, ]))
+  names(out) <- cluster_region$Cluster
+  saveRDS(out, cf)
+  rm(d, out); gc()
+}
+
+for (i in seq_len(nrow(meta_info))) {
+  cf <- file.path(cache_dir, paste0("meta_", meta_info$GCST[i], ".rds"))
+  if (file.exists(cf)) next
+  reg <- cluster_region[cluster_region$Cluster == meta_info$Cluster[i], ]
+  cat(sprintf("Reading metabolite GWAS %s (%s) ...\n", meta_info$GCST[i], meta_info$Exposure[i]))
+  d <- fread(meta_info$gw_file[i],
+             select = c("chromosome", "base_pair_location", "variant_id",
+                        "effect_allele", "other_allele", "beta", "standard_error"))
+  saveRDS(extract_from_meta(d, reg), cf)
+  rm(d); gc()
+}
+cat("Regional extraction completed.\n")
+```
+
+**Chunk purpose.** Align effect alleles, run HyPrColoc, and calculate 95% credible sets.
+
+```{r coloc-05-06-align-and-hyprcoloc}
+# Source file: 5_HyPrColoc_cluster_sleep_duration.R
+## 5. Allele alignment and HyPrColoc
+align_traits <- function(traits, ref_name) {
+  keys <- Reduce(intersect, lapply(traits, function(x) x$key))
+  if (length(keys) < MIN_SNP_KEEP) return(NULL)
+  ref <- traits[[ref_name]]; ref <- ref[match(keys, ref$key), ]
+  b <- matrix(NA_real_, length(keys), length(traits),
+              dimnames = list(keys, names(traits)))
+  s <- b
+  for (tn in names(traits)) {
+    x <- traits[[tn]][match(keys, traits[[tn]]$key), ]
+    same <- x$EA == ref$EA & x$OA == ref$OA
+    flip <- x$EA == ref$OA & x$OA == ref$EA
+    v <- ifelse(same, x$beta, ifelse(flip, -x$beta, NA_real_))
+    b[, tn] <- v
+    s[, tn] <- x$se
+  }
+  keep <- stats::complete.cases(b) & stats::complete.cases(s)
+  list(betas = b[keep, , drop = FALSE], ses = s[keep, , drop = FALSE])
+}
+
+sleep_cache <- lapply(names(sleep_files), function(tr) {
+  readRDS(file.path(cache_dir, paste0("sleep_", gsub("[^A-Za-z]+", "_", tr), ".rds")))
+})
+names(sleep_cache) <- names(sleep_files)
+
+all_results <- list(); snp_counts <- list(); credible_sets <- list()
+
+for (cl in names(clusters)) {
+  cat("\n==========", cl, "==========\n")
+  reg  <- cluster_region[cluster_region$Cluster == cl, ]
+  mi   <- meta_info[meta_info$Cluster == cl, ]
+
+  traits <- list()
+  for (tr in names(sleep_files)) traits[[tr]] <- sleep_cache[[tr]][[cl]]
+  for (i in seq_len(nrow(mi))) {
+    nm <- mi$Exposure[i]
+    traits[[nm]] <- readRDS(file.path(cache_dir, paste0("meta_", mi$GCST[i], ".rds")))
+  }
+
+  aligned <- align_traits(traits, ref_name = "Sleep duration")
+  if (is.null(aligned)) { cat("Too few shared SNPs; skipped\n"); next }
+  betas <- aligned$betas; ses <- aligned$ses
+  cat("Number of traits:", ncol(betas), "; shared SNPs:", nrow(betas), "\n")
+
+  rsid <- sleep_cache[["Sleep duration"]][[cl]]$SNP[match(rownames(betas),
+                    sleep_cache[["Sleep duration"]][[cl]]$key)]
+  snp_id <- ifelse(is.na(rsid) | rsid == "NA", rownames(betas), rsid)
+
+  res <- hyprcoloc::hyprcoloc(effect.est = betas, effect.se = ses,
+                              trait.names = colnames(betas), snp.id = snp_id,
+                              snpscores = TRUE)
+
+  rr <- as.data.frame(res[[1]])
+  rr$Cluster <- cl
+  all_results[[cl]] <- rr
+  snp_counts[[cl]] <- data.frame(Cluster = cl, n_traits = ncol(betas),
+                                 n_SNP_common = nrow(betas),
+                                 stringsAsFactors = FALSE)
+
+  cs_rows <- list()
+  df1 <- res[[1]]; sc <- res[[2]]
+  idx_cluster <- which(!is.na(df1$posterior_prob))
+  for (j in seq_along(idx_cluster)) {
+    if (j > length(sc)) break
+    scj <- sc[[j]]
+    if (is.null(scj) || all(is.na(scj))) next
+    names(scj) <- snp_id
+    keep <- scj >= (1 - 0.95) / length(scj)
+    scj  <- sort(scj[keep], decreasing = TRUE)
+    n_use <- max(1, min(which(cumsum(scj) >= 0.95)))
+    csj  <- scj[seq_len(n_use)]
+    cs_rows[[length(cs_rows) + 1]] <- data.frame(
+      Cluster = cl, iteration = idx_cluster[j],
+      n_snp_in_credible_set = n_use,
+      credible_set = paste(names(csj), sprintf("%.4f", as.numeric(csj)), sep = ":", collapse = "; "),
+      stringsAsFactors = FALSE)
+  }
+  credible_sets[[cl]] <- if (length(cs_rows)) do.call(rbind, cs_rows) else NULL
+
+  write.csv(rr, file.path(out_dir, paste0("HyPrColoc_", cl, ".csv")),
+            row.names = FALSE, fileEncoding = "UTF-8")
+  if (!is.null(credible_sets[[cl]]))
+    write.csv(credible_sets[[cl]],
+              file.path(out_dir, paste0("HyPrColoc_", cl, "_credibleset.csv")),
+              row.names = FALSE, fileEncoding = "UTF-8")
+  print(rr, row.names = FALSE)
+
+  if (isTRUE(RUN_SENSITIVITY)) {
+    sp <- tryCatch(
+      hyprcoloc::sensitivity.plot(effect.est = betas, effect.se = ses,
+                                  trait.names = colnames(betas), snp.id = snp_id),
+      error = function(e) { cat("Sensitivity analysis failed: ", conditionMessage(e), "\n"); NULL })
+    if (!is.null(sp)) {
+      save_pheatmap <- function(p, file, w, h) {
+        if (grepl("\\.pdf$", file)) pdf(file, width = w, height = h)
+        else png(file, width = w, height = h, units = "in", res = 300)
+        grid::grid.newpage(); grid::grid.draw(p$gtable); dev.off()
+      }
+      save_pheatmap(sp, file.path(out_dir, paste0("HyPrColoc_", cl, "_sensitivity.png")), 8, 6.5)
+      save_pheatmap(sp, file.path(out_dir, paste0("HyPrColoc_", cl, "_sensitivity.pdf")), 8, 6.5)
+    }
+  }
+}
+```
+
+**Chunk purpose.** Assemble the summary workbook, data dictionary, and console report.
+
+```{r coloc-05-07-write-results}
+# Source file: 5_HyPrColoc_cluster_sleep_duration.R
+## 6. Output summary
+res_all  <- do.call(rbind, all_results);  rownames(res_all) <- NULL
+cnt_all  <- do.call(rbind, snp_counts);   rownames(cnt_all) <- NULL
+cs_all   <- do.call(rbind, credible_sets[!vapply(credible_sets, is.null, logical(1))])
+rownames(cs_all) <- NULL
+
+cluster_region_out <- merge(cluster_region, cnt_all, by = "Cluster", all.x = TRUE)
+write.csv(cluster_region_out,
+          file.path(out_dir, "HyPrColoc_cluster_regions.csv"),
+          row.names = FALSE, fileEncoding = "UTF-8")
+
+wb <- createWorkbook()
+addWorksheet(wb, "0_Overview");    writeData(wb, "0_Overview", cluster_region_out)
+addWorksheet(wb, "HyPrColoc results"); writeData(wb, "HyPrColoc results", res_all)
+addWorksheet(wb, "Cluster metabolites"); writeData(wb, "Cluster metabolites", meta_info)
+addWorksheet(wb, "Credible sets (95%)");  writeData(wb, "Credible sets (95%)", cs_all)
+for (cl in names(all_results)) {
+  s <- paste0("res_", cl)
+  addWorksheet(wb, s); writeData(wb, s, all_results[[cl]])
+}
+for (sn in names(wb)) { freezePane(wb, sn, firstRow = TRUE)
+  setColWidths(wb, sn, cols = 1:12, widths = "auto") }
+
+notes <- data.frame(Note = c(
+  paste0("HyPrColoc analysis (hyprcoloc R package v", as.character(packageVersion("hyprcoloc")), ")"),
+  "For each LD-overlap cluster: traits = the cluster's metabolites + Sleep duration + Long sleep duration + Short sleep duration",
+  "Region per cluster = the locus containing most of the cluster's instrumental variables (+/- 500 kb) in hg38",
+  paste0("Metabolite GWAS: GWAS Catalog harmonized summary statistics (", meta_dir, "/GCST*.tsv.gz, hg38)"),
+  "Sleep GWAS: Dashti et al. 2019 UK Biobank, hg38 (sleep_duration / long_sleep_duration / short_sleep_duration, unadjBMI)",
+  "SNPs were matched across traits by hg38 chromosome:position; effect alleles were aligned to the Sleep duration reference allele (mismatched allele pairs dropped)",
+  "HyPrColoc was run with default priors (prior.1 = 1e-4, prior.c = 0.02) and an identity LD matrix, i.e. the standard basic usage in the vignette",
+  "Method: multi-trait HyPrColoc colocalization by LD-overlap cluster"
+))
+addWorksheet(wb, "Methods"); writeData(wb, "Methods", notes)
+setColWidths(wb, "Methods", cols = 1, widths = 160)
+
+dict <- data.frame(
+  Sheet = c(rep("HyPrColoc results / res_C1-C8", 8), rep("0_Overview / cluster_regions", 9),
+            rep("Cluster metabolites", 5), rep("Credible sets (95%)", 4)),
+  Column = c("Cluster", "iteration", "traits", "posterior_prob", "regional_prob",
+             "candidate_snp", "posterior_explained_by_snp", "dropped_trait",
+             "Cluster", "CHR", "start", "end", "n_IV_in_locus", "lead_snp",
+             "IVs_in_locus", "n_traits", "n_SNP_common",
+             "Cluster", "Exposure", "GCST", "HMDB", "gw_file",
+             "Cluster", "iteration", "n_snp_in_credible_set", "credible_set"),
+  Meaning = c(
+    "Lipid-cluster identifier from the LD-overlap clustering (C1-C8)",
+    "HyPrColoc Bayesian splitting iteration: the first round reports the strongest colocalized trait set, which is then removed before the next round",
+    "Traits colocalized in this iteration (comma-separated; metabolites use their names). None indicates that no set met the threshold and the row reports the traits dropped in that iteration",
+    "Colocalization posterior probability P: probability that these traits share one causal variant (0-1). The main criterion requires P > 0.5 and regional_prob above its threshold",
+    "Regional association probability: probability that all tested traits have a regional association signal; it is required for colocalization and is always at least posterior_prob",
+    "Candidate causal SNP for the colocalized set (the SNP explaining the largest posterior share; rsID)",
+    "Posterior share explained by the candidate SNP alone (0-1); its ceiling depends on regional LD (for example, 0.5 if the SNP is in perfect LD with one other SNP)",
+    "Traits removed in this iteration because they were assigned outside the colocalized set; NA means no additional trait was removed",
+    "Lipid-cluster identifier for this analysis (C1-C8)",
+    "Chromosome of the cluster core locus (hg38)",
+    "Analysis-region start = minimum IV position in the locus minus 500 kb (hg38)",
+    "Analysis-region end = maximum IV position in the locus plus 500 kb (hg38)",
+    "Number of cluster instruments in the locus (IVs on the same chromosome and within 1 Mb are merged into one locus)",
+    "Leftmost instrument in the locus (a positional marker, not necessarily the strongest association)",
+    "All instruments in the locus",
+    "Number of traits in this HyPrColoc run = cluster metabolites plus three sleep-duration traits",
+    "Number of SNPs shared by all traits after allele alignment (the SNPs actually used by HyPrColoc)",
+    "Lipid-cluster identifier for this analysis (C1-C8)",
+    "Metabolite name (matching the Exposure column in MR_Significant_MetaboliteSleep.xlsx)",
+    "GWAS Catalog identifier (the Metabolite ID in the MR table, e.g. 90199649 -> GCST90199649), used to locate the GWAS file",
+    "HMDB identifier; 0 in the source table means that no HMDB identifier is available",
+    "Full path of the metabolite GWAS file that was read",
+    "Lipid-cluster identifier for this analysis (C1-C8)",
+    "HyPrColoc iteration corresponding to this credible set",
+    "Number of SNPs in the 95% credible set",
+    "SNPs and posterior probabilities in the 95% credible set (SNP:probability, sorted by decreasing probability and separated by semicolons)"),
+  stringsAsFactors = FALSE)
+addWorksheet(wb, "Column dictionary")
+writeData(wb, "Column dictionary", dict)
+setColWidths(wb, "Column dictionary", cols = 1:3, widths = c(30, 28, 110))
+
+xlsx_out <- file.path(out_dir, "HyPrColoc_all_results.xlsx")
+can_write <- function(p) {
+  if (!file.exists(p)) return(TRUE)
+  con <- try(file(p, "r+b"), silent = TRUE)
+  if (inherits(con, "try-error")) return(FALSE)
+  close(con); TRUE
+}
+if (!can_write(xlsx_out)) xlsx_out <- sub("\\.xlsx$", format(Sys.time(), "_%H%M%S.xlsx"), xlsx_out)
+saveWorkbook(wb, xlsx_out, overwrite = TRUE)
+cat("\nWritten: ", xlsx_out, "\n")
+
+cat("\n================ Results summary ================\n")
+print(res_all[, intersect(c("Cluster","traits","posterior_prob","regional_prob",
+                            "candidate_snp","posterior_explained_by_snp","dropped_trait"),
+                          colnames(res_all))], row.names = FALSE)
+cat("\nDone.\n")
+```

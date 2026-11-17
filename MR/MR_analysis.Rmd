@@ -1,0 +1,2169 @@
+---
+title: "Mendelian randomization of plasma metabolites and sleep traits"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+This document integrates all numbered scripts in the former **MR** folder. Run the chunks in order. The only user-specific input is `project_root`: replace the placeholder `"Path"` once in the setup chunk. Input files are read from the relative data subfolders, while all results are written to `MR/outputs`.
+
+## Integrated setup and relative paths
+
+```{r mr-00-setup, include=FALSE}
+# Source file: 1_circulation_metabolites_and_sleep_mr.Rmd / integrated setup
+# Integrated setup shared by every chunk.
+project_root <- normalizePath("Path", winslash = "/", mustWork = FALSE)
+
+data_dir               <- file.path(project_root, "Data")
+metabolite_gwas_dir    <- file.path(data_dir, "Metabolite_GWAS")
+sleep_gwas_dir         <- file.path(data_dir, "Sleep_GWAS")
+reference_dir          <- file.path(data_dir, "Reference")
+ld_bfile               <- file.path(data_dir, "LD_Reference", "EUR")
+phenoscanner_dir       <- file.path(data_dir, "PhenoScanner")
+
+code_dir               <- file.path(project_root, "MetaboliteSleep_Code")
+mr_code_dir            <- file.path(code_dir, "MR")
+repeat_code_dir        <- file.path(code_dir, "RepeatMR")
+coloc_code_dir         <- file.path(code_dir, "Colocalization")
+mr_output_dir          <- file.path(mr_code_dir, "outputs")
+repeat_output_dir      <- file.path(repeat_code_dir, "outputs")
+coloc_output_dir       <- file.path(coloc_code_dir, "outputs")
+
+dir.create(mr_output_dir, recursive = TRUE, showWarnings = FALSE)
+for (d in c("clump_data", "harmonise_data", "mr_res", "Fisher's test")) {
+  dir.create(file.path(mr_output_dir, d), recursive = TRUE, showWarnings = FALSE)
+}
+
+catalog_file            <- file.path(reference_dir, "gwas_catalog_summary_statistics_table_export.tsv")
+sleep_trait_file        <- file.path(reference_dir, "GWAS_sleep_trait.xlsx")
+
+# Resolve paths stored in the sleep metadata workbook. Existing absolute paths
+# are used when present; otherwise the file is located by basename under Data/Sleep_GWAS.
+resolve_sleep_resource <- function(path_value) {
+  path_value <- as.character(path_value)
+  if (file.exists(path_value)) return(normalizePath(path_value, winslash = "/", mustWork = TRUE))
+  hits <- list.files(sleep_gwas_dir, recursive = TRUE, full.names = TRUE)
+  hits <- hits[basename(hits) == basename(path_value)]
+  if (length(hits) == 1L) return(normalizePath(hits, winslash = "/", mustWork = TRUE))
+  if (length(hits) == 0L) stop("Sleep-GWAS resource not found under Data/Sleep_GWAS: ", basename(path_value))
+  stop("More than one matching sleep-GWAS resource was found: ", paste(basename(hits), collapse = ", "))
+}
+
+pathway_file            <- file.path(reference_dir, "20231120_metabolite_pathway.xlsx")
+hmdb_file               <- file.path(reference_dir, "20231121_1091metabolite_HMDBID.xlsx")
+ultimate_trait_file     <- file.path(reference_dir, "20240322_metabolite_id_ulttrait.xlsx")
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(data.table)
+  library(readxl)
+  library(openxlsx)
+  library(TwoSampleMR)
+  library(plinkbinr)
+  library(ieugwasr)
+  library(ggplot2)
+  library(mr.raps)
+})
+```
+
+## 1. Metabolites as exposure and sleep traits as outcome
+
+```{r mr-01-01-prepare-data}
+# Source file: 1_circulation_metabolites_and_sleep_mr.Rmd
+file_dir <- metabolite_gwas_dir
+
+sleep_table<-read_excel(sleep_trait_file,sheet = "sleep_trait_out")
+
+row_file<-data.frame(gwas_id=NA,sleep_type=NA,all_row=NA,p5e6_row=NA,p5e8_row=NA,format_row=NA,clump1_row=NA,clump2_row=NA,clump3_row=NA,harmonise1_row=NA,harmonise2_row=NA,harmonise3_row=NA)
+
+#90199621 90201020
+start_id = 90199621
+end_id = 90201020
+```
+
+```{r mr-01-02-harmonise-metabolites-to-sleep}
+# Source file: 1_circulation_metabolites_and_sleep_mr.Rmd
+r<-0
+for (id in c(start_id:end_id)) {
+  r<-r+1
+  row_file[r,] <- NA
+  #all_snp
+  metabolite<-fread(paste(file_dir,"GCST",id,".tsv.gz",sep = ""))
+  row_file[["gwas_id"]][r]<-id
+  row_file[["all_row"]][r]<-nrow(metabolite)
+  #pselect5e6
+  metabolite_p5e6<-subset(metabolite,p_value<5e-6)
+  row_file[["p5e6_row"]][r]<-nrow(metabolite_p5e6)
+  
+  #pselect5e8
+  metabolite_p5e8<-subset(metabolite,p_value<5e-8)
+  row_file[["p5e8_row"]][r]<-nrow(metabolite_p5e8)
+  if(nrow(metabolite_p5e8)==0){
+    r<-r+1
+    row_file[r,] <- NA
+    next
+  }
+  
+  if(nrow(metabolite_p5e8)==1 & is.na(metabolite_p5e8[["variant_id"]][1])){
+    r<-r+1
+    row_file[r,] <- NA
+    next
+  }
+  
+  #format
+  metabolite_format<-format_data(metabolite_p5e8,
+                                 type = "exposure",header = TRUE,snps = NULL,
+                                 snp_col = "variant_id",chr_col = "chromosome",
+                                 pos_col = "base_pair_location",
+                                 effect_allele_col = "effect_allele",
+                                 other_allele_col = "other_allele",beta_col = "beta",
+                                 se_col = "standard_error",
+                                 eaf_col = "effect_allele_frequency",
+                                 pval_col = "p_value")
+  metabolite_format$exposure<-id
+  row_file[["format_row"]][r]<-nrow(metabolite_format)
+  
+  #clump
+  metabolite_clump_temp<-metabolite_format[,c("SNP","pval.exposure")]
+  pre_clump_data <- metabolite_clump_temp %>% select(rsid = SNP,pval = pval.exposure)
+  metabolite_sleep_clump1 <- tryCatch({
+    ld_clump_local(pre_clump_data,
+                  clump_kb = 1000,  
+                  clump_r2 = 0.1,  
+                  clump_p = 5*10^(-8),  
+                  plink_bin = get_plink_exe(),  
+                  bfile = ld_bfile) %>% {.$rsid}
+    }, error=function(e) {})
+  row_file[["clump1_row"]][r]<-length(metabolite_sleep_clump1)
+  clump1 <- subset(metabolite_format, SNP %in% metabolite_sleep_clump1)
+  
+  metabolite_sleep_clump2 <- tryCatch({
+    ld_clump_local(pre_clump_data,
+                  clump_kb = 1000,  
+                  clump_r2 = 0.01,  
+                  clump_p = 5*10^(-8),  
+                  plink_bin = get_plink_exe(),  
+                  bfile = ld_bfile) %>% {.$rsid}
+    }, error=function(e) {})
+  row_file[["clump2_row"]][r]<-length(metabolite_sleep_clump2)
+  clump2 <- subset(metabolite_format, SNP %in% metabolite_sleep_clump2)
+  
+  metabolite_sleep_clump3 <- tryCatch({
+    ld_clump_local(pre_clump_data,
+                  clump_kb = 10000,  
+                  clump_r2 = 0.001,  
+                  clump_p = 5*10^(-8),  
+                  plink_bin = get_plink_exe(),  
+                  bfile = ld_bfile) %>% {.$rsid}
+    }, error=function(e) {})
+  row_file[["clump3_row"]][r]<-length(metabolite_sleep_clump3)
+  clump3 <- subset(metabolite_format, SNP %in% metabolite_sleep_clump3)
+  
+  save(clump1,file = file.path(paste("clump_data/",
+                                      id,"_clump1.RData",sep = "")))
+  save(clump2,file = file.path(paste("clump_data/",
+                                      id,"_clump2.RData",sep = "")))
+  save(clump3,file = file.path(paste("clump_data/",
+                                      id,"_clump3.RData",sep = "")))
+  
+
+  for (i in 1:dim(sleep_table)[1]) {
+    load(file = resolve_sleep_resource(sleep_table[i, 'local_allSNP_path']))
+    if(sleep_table[i,'trait']=="napping"|sleep_table[i,'trait']=="morning_person"|
+       sleep_table[i,'trait']=="chronotype"){
+      out_allSNP <- dat_allSNP_hg19
+      rm(dat_allSNP_hg19)
+      setnames(out_allSNP,"EAF","FREQ")
+    }
+    else{
+      out_allSNP <- get(paste(sleep_table[i,'trait'],"allSNP",sep = "_"))
+      rm(list = paste(sleep_table[i,'trait'],"allSNP",sep = "_"))
+    }
+    row_file[["sleep_type"]][r]<-as.character(sleep_table[i,'trait'])
+    
+    
+    #outcome
+    out1<-tryCatch({
+      format_data(out_allSNP,type = "outcome",header = TRUE,
+                      snps = clump1$SNP,snp_col = "SNP",
+                      pos_col = "BP",chr_col = "CHR",
+                      effect_allele_col = "Effect_Allele",
+                      other_allele_col = "Other_Allele",beta_col = "BETA",
+                      se_col = "BETA_SE",pval_col = "P",eaf_col = "FREQ")
+    }, error=function(e) {})
+    if(length(out1)!=0)
+      out1$outcome<-as.character(sleep_table[i,'trait']) 
+    
+    out2<-tryCatch({
+      format_data(out_allSNP,type = "outcome",header = TRUE,
+                      snps = clump2$SNP,snp_col = "SNP",
+                      pos_col = "BP",chr_col = "CHR",
+                      effect_allele_col = "Effect_Allele",
+                      other_allele_col = "Other_Allele",beta_col = "BETA",
+                      se_col = "BETA_SE",pval_col = "P",eaf_col = "FREQ")
+    }, error=function(e) {})
+    if(length(out2)!=0)
+      out2$outcome<-as.character(sleep_table[i,'trait'])
+    
+    out3<-tryCatch({
+      format_data(out_allSNP,type = "outcome",header = TRUE,
+                      snps = clump3$SNP,snp_col = "SNP",
+                      pos_col = "BP",chr_col = "CHR",
+                      effect_allele_col = "Effect_Allele",
+                      other_allele_col = "Other_Allele",beta_col = "BETA",
+                      se_col = "BETA_SE",pval_col = "P",eaf_col = "FREQ")
+    }, error=function(e) {})
+    if(length(out3)!=0)
+      out3$outcome<-as.character(sleep_table[i,'trait'])
+    
+    if(length(out1)==0|length(out2)==0|length(out3)==0){
+      row_file[["harmonise1_row"]][r]<-0
+      row_file[["harmonise2_row"]][r]<-0
+      row_file[["harmonise3_row"]][r]<-0
+      r<-r+1
+      row_file[r,] <- NA
+      next
+    }
+    
+    #harmonise
+    exp_out_har1<-harmonise_data(clump1,out1,action = 2)
+    row_file[["harmonise1_row"]][r]<-nrow(exp_out_har1)
+    exp_out_har2<-harmonise_data(clump2,out2,action = 2)
+    row_file[["harmonise2_row"]][r]<-nrow(exp_out_har2)
+    exp_out_har3<-harmonise_data(clump3,out3,action = 2)
+    row_file[["harmonise3_row"]][r]<-nrow(exp_out_har3)
+    
+    save(exp_out_har1,file = file.path(paste("harmonise_data/",
+                             id,"_",sleep_table[i,'trait'],"_har1.RData",sep = "")))
+    write.csv(exp_out_har1,file = file.path(paste("harmonise_data/",
+                             id,"_",sleep_table[i,'trait'],"_har1.csv",sep = "")))
+    save(exp_out_har2,file = file.path(paste("harmonise_data/",
+                             id,"_",sleep_table[i,'trait'],"_har2.RData",sep = "")))
+    write.csv(exp_out_har2,file = file.path(paste("harmonise_data/",
+                             id,"_",sleep_table[i,'trait'],"_har2.csv",sep = "")))
+    save(exp_out_har3,file = file.path(paste("harmonise_data/",
+                             id,"_",sleep_table[i,'trait'],"_har3.RData",sep = "")))
+    write.csv(exp_out_har3,file = file.path(paste("harmonise_data/",
+                             id,"_",sleep_table[i,'trait'],"_har3.csv",sep = "")))
+    
+    save(exp_out_har1,exp_out_har2,exp_out_har3,file = file.path(paste("harmonise_data/",
+                             id,"_",sleep_table[i,'trait'],"_har.RData",sep = "")))
+  
+    r<-r+1
+    row_file[r,] <- NA
+  }
+}
+
+#save file
+write.csv(row_file,file = file.path("metabolite_sleep_all_p5e8_format_clump_har_row.csv"),row.names = FALSE)
+```
+
+```{r mr-01-03-run-metabolite-sleep-mr}
+# Source file: 1_circulation_metabolites_and_sleep_mr.Rmd
+combine_all_mrresults <- function (res, het, plt, sin, ao_slc = T, Exp = F, split.exposure = F, split.outcome = F) 
+{
+    requireNamespace("plyr", quietly = TRUE)
+    het <- het[, c("id.exposure", "id.outcome", "method", "Q", 
+        "Q_df", "Q_pval")]
+       sin <- sin[grep("[:0-9:]", sin$SNP), ]
+    sin$method <- "Wald ratio"
+    names(sin)[names(sin) == "p"] <- "pval"
+    names(res)[names(res) == "method"] <- "Method"
+    names(het)[names(het) == "method"] <- "Method"
+    names(sin)[names(sin) == "method"] <- "Method"
+    res <- merge(res, het, by = c("id.outcome", "id.exposure", 
+        "Method"), all.x = T)
+    res <- plyr::rbind.fill(res, sin[, c("exposure", "outcome", 
+        "id.exposure", "id.outcome", "SNP", "b", "se", "pval", 
+        "Method")])
+    if (ao_slc) {
+        ao <- available_outcomes()
+        names(ao)[names(ao) == "nsnp"] <- "nsnps.outcome.array"
+        res <- merge(res, ao[, !names(ao) %in% c("unit", "priority", 
+            "sd", "path", "note", "filename", "access", "mr")], 
+            by.x = "id.outcome", by.y = "id")
+    }
+    res$nsnp[is.na(res$nsnp)] <- 1
+    for (i in unique(res$id.outcome)) {
+        Methods <- unique(res$Method[res$id.outcome == i])
+        Methods <- Methods[Methods != "Wald ratio"]
+        for (j in unique(Methods)) {
+            res$SNP[res$id.outcome == i & res$Method == j] <- 
+              paste(res$SNP[res$id.outcome == 
+                i & res$Method == "Wald ratio"], collapse = "; ")
+        }
+    }
+    if (Exp) {
+        res$or <- exp(res$b)
+        res$or_lci95 <- exp(res$b - res$se * 1.96)
+        res$or_uci95 <- exp(res$b + res$se * 1.96)
+    }
+    plt <- plt[, c("id.outcome", "id.exposure", "egger_intercept", 
+        "se", "pval")]
+    plt$Method <- "MR Egger"
+    names(plt)[names(plt) == "egger_intercept"] <- "intercept"
+    names(plt)[names(plt) == "se"] <- "intercept_se"
+    names(plt)[names(plt) == "pval"] <- "intercept_pval"
+    res <- merge(res, plt, by = c("id.outcome", "id.exposure", 
+        "Method"), all.x = T)
+    if (split.exposure) {
+        res <- split_exposure(res)
+    }
+    if (split.outcome) {
+        res <- split_outcome(res)
+    }
+    Cols <- c("Method", "outcome", "exposure", "nsnp", "b", "se", 
+        "pval", "intercept", "intercept_se", "intercept_pval", 
+        "Q", "Q_df", "Q_pval", "consortium", "ncase", "ncontrol", 
+        "pmid", "population")
+    res <- res[, c(names(res)[names(res) %in% Cols], names(res)[which(!names(res) %in% 
+        Cols)])]
+    return(res)
+}
+
+all_res<-data.frame(Method=NA,outcome=NA,exposure=NA,nsnp=NA,b=NA,se=NA,pval=NA,Q=NA,Q_df=NA,Q_pval=NA,intercept=NA,intercept_se=NA,intercept_pval=NA,id.outcome=NA,id.exposure=NA,exp_out_har_pair=NA)
+
+start_id = 90199621
+end_id = 90201020
+
+sleep_table<-read_excel(sleep_trait_file,sheet = "sleep_trait_out")
+
+for (id in c(start_id:end_id)) {
+  for (i in 1:dim(sleep_table)[1]) {
+    if(file.exists(paste("harmonise_data/",id,"_",sleep_table[i,'trait'],
+                         "_har.RData",sep = ""))){
+      folder_path<-paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",sep = "")
+      dir.create(folder_path)
+    
+      load(paste("harmonise_data/",id,"_",sleep_table[i,'trait'],"_har.RData",sep = ""))
+    }
+    else next
+    
+    ##har1_mr
+    #MR with default method=deft
+    if(nrow(subset(exp_out_har1,mr_keep==TRUE))>1){
+    exp_out_har1_mrdeft<-mr(exp_out_har1,method_list=                               
+                              c("mr_ivw","mr_egger_regression","mr_weighted_median"))
+    exp_out_har1_mrhet<-mr_heterogeneity(exp_out_har1)
+    exp_out_har1_mrplt<-mr_pleiotropy_test(exp_out_har1)
+    exp_out_har1_mrsin<-mr_singlesnp(exp_out_har1)
+    exp_out_har1_mrloo<-mr_leaveoneout(exp_out_har1)
+
+    #plots
+    exp_out_har1_scatP<-mr_scatter_plot(exp_out_har1_mrdeft,exp_out_har1)
+    exp_out_har1_scatP
+    ggsave(exp_out_har1_scatP[[1]], 
+           file=file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har1_scatP.pdf",sep = "")))
+
+    exp_out_har1_sinP<-mr_forest_plot(exp_out_har1_mrsin)
+    exp_out_har1_sinP
+    ggsave(exp_out_har1_sinP[[1]], 
+           file=file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har1_sinP.pdf",sep = "")))
+
+    exp_out_har1_looP<-mr_leaveoneout_plot(exp_out_har1_mrloo)
+    exp_out_har1_looP
+    ggsave(exp_out_har1_looP[[1]], 
+           file=file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har1_looP.pdf",sep = "")))
+
+    exp_out_har1_funnelP<-mr_funnel_plot(exp_out_har1_mrsin)
+    exp_out_har1_funnelP
+    ggsave(exp_out_har1_funnelP[[1]], 
+           file=file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har1_funnelP.pdf",sep = "")))
+
+    #combine_all_mrresults 
+    exp_out_har1_mrallres<-combine_all_mrresults(res = exp_out_har1_mrdeft, 
+                                           het= exp_out_har1_mrhet,
+                                           plt =exp_out_har1_mrplt,
+                                           sin = exp_out_har1_mrsin, 
+                                           ao_slc = FALSE)
+    write.csv(exp_out_har1_mrallres,file = 
+                file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har1_mr_allres.csv",sep = "")))
+
+    ##subset for rbind
+    exp_out_har1_mrsubres<-exp_out_har1_mrallres[-which(exp_out_har1_mrallres$Method==
+                                                          "Wald ratio"),]
+    exp_out_har1_mrsubres<-exp_out_har1_mrsubres[,c("Method","outcome","exposure",                              "nsnp","b","se","pval","Q","Q_df","Q_pval","intercept",                                   "intercept_se","intercept_pval","id.outcome","id.exposure")]
+    write.csv(exp_out_har1_mrsubres,file = 
+                file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har1_mr_subres.csv",sep = "")))
+
+    #add mr.raps for weak instrumental
+    exp_out_har1_mrraps<-mr.raps(b_exp = exp_out_har1$beta.exposure,
+                                 b_out = exp_out_har1$beta.outcome,
+                                 se_exp = exp_out_har1$se.exposure,
+                                 se_out = exp_out_har1$se.outcome)
+    write.csv(exp_out_har1_mrraps,file= 
+                file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har1_mr_rapsres.csv",sep = "")))
+
+    ##transform list to data.frame
+    exp_out_har1_mrraps_re<-as.data.frame(exp_out_har1_mrraps)
+
+    ##rename colnames to merge
+    setnames(exp_out_har1_mrraps_re,c("beta.hat","beta.se","beta.p.value"),
+             c("b","se","pval"))
+    exp_out_har1_mrraps_re$Method<-"MR RAPS"
+    exp_out_har1_mrraps_re$outcome<-as.character(sleep_table[i,'trait'])
+    exp_out_har1_mrraps_re$exposure<-as.character(id)
+    exp_out_har1_mrraps_re$nsnp<-exp_out_har1_mrdeft[1,"nsnp"]
+    exp_out_har1_mrraps_re$Q<-"NA"
+    exp_out_har1_mrraps_re$Q_df<-"NA"
+    exp_out_har1_mrraps_re$Q_pval<-"NA"
+    exp_out_har1_mrraps_re$intercept<-"NA"
+    exp_out_har1_mrraps_re$intercept_se<-"NA"
+    exp_out_har1_mrraps_re$intercept_pval<-"NA"
+    exp_out_har1_mrraps_re$id.outcome<-"NA"
+    exp_out_har1_mrraps_re$id.exposure<-"NA"
+    exp_out_har1_mrraps_re<-exp_out_har1_mrraps_re[,c("Method","outcome","exposure",                       "nsnp","b","se","pval","Q","Q_df","Q_pval","intercept","intercept_se",                                             "intercept_pval","id.outcome","id.exposure")]
+
+    #rbind mr results
+    exp_out_har1_mr_bindres<-rbind(exp_out_har1_mrsubres,exp_out_har1_mrraps_re)
+    exp_out_har1_mr_bindres$exp_out_har_pair=as.character(paste(id,                                                           sleep_table[i,'trait'],"har1",sep = "_"))
+    write.csv(exp_out_har1_mr_bindres,file = 
+                file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har1_mr_bindres.csv",sep = "")))
+    }else if(nrow(subset(exp_out_har1,mr_keep==TRUE))==1){
+        exp_out_har1_mr_bindres<-data.frame(Method=NA,outcome=NA,exposure=NA,nsnp=NA,                 b=NA,se=NA,pval=NA,Q=NA,Q_df=NA,Q_pval=NA,intercept=NA,intercept_se=NA,                   intercept_pval=NA,id.outcome=NA,id.exposure=NA,exp_out_har_pair=NA)
+      exp_out_har1_mrdeft<-mr(exp_out_har1)
+      exp_out_har1_mr_bindres[1,"Method"]<-exp_out_har1_mrdeft[1,"method"]
+      exp_out_har1_mr_bindres[1,"outcome"]<-exp_out_har1_mrdeft[1,"outcome"]
+      exp_out_har1_mr_bindres[1,"exposure"]<-exp_out_har1_mrdeft[1,"exposure"]
+      exp_out_har1_mr_bindres[1,"nsnp"]<-exp_out_har1_mrdeft[1,"nsnp"]
+      exp_out_har1_mr_bindres[1,"b"]<-exp_out_har1_mrdeft[1,"b"]
+      exp_out_har1_mr_bindres[1,"se"]<-exp_out_har1_mrdeft[1,"se"]
+      exp_out_har1_mr_bindres[1,"pval"]<-exp_out_har1_mrdeft[1,"pval"]
+      exp_out_har1_mr_bindres[1,"id.outcome"]<-exp_out_har1_mrdeft[1,"id.outcome"]
+      exp_out_har1_mr_bindres[1,"id.exposure"]<-exp_out_har1_mrdeft[1,"id.exposure"]
+      exp_out_har1_mr_bindres[1,"exp_out_har_pair"]=as.character(
+        paste(id,sleep_table[i,'trait'],"har1",sep = "_"))
+      write.csv(exp_out_har1_mr_bindres,file = 
+                file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har1_mr_bindres.csv",sep = "")))
+    }else{
+        exp_out_har1_mr_bindres<-data.frame(Method=NA,outcome=NA,exposure=NA,nsnp=NA,                 b=NA,se=NA,pval=NA,Q=NA,Q_df=NA,Q_pval=NA,intercept=NA,intercept_se=NA,                   intercept_pval=NA,id.outcome=NA,id.exposure=NA,exp_out_har_pair=NA)
+      exp_out_har1_mr_bindres[1,"Method"]<-"None"
+      exp_out_har1_mr_bindres[1,"outcome"]<-as.character(sleep_table[i,'trait'])
+      exp_out_har1_mr_bindres[1,"exposure"]<-as.character(id)
+      exp_out_har1_mr_bindres[1,"nsnp"]<-nrow(exp_out_har1)
+    }
+    
+    
+    ##har2_mr
+    #MR with default method=deft
+    if(nrow(subset(exp_out_har2,mr_keep==TRUE))>1){
+    exp_out_har2_mrdeft<-mr(exp_out_har2,method_list=                               
+                              c("mr_ivw","mr_egger_regression","mr_weighted_median"))
+    exp_out_har2_mrhet<-mr_heterogeneity(exp_out_har2)
+    exp_out_har2_mrplt<-mr_pleiotropy_test(exp_out_har2)
+    exp_out_har2_mrsin<-mr_singlesnp(exp_out_har2)
+    exp_out_har2_mrloo<-mr_leaveoneout(exp_out_har2)
+
+    #plots
+    exp_out_har2_scatP<-mr_scatter_plot(exp_out_har2_mrdeft,exp_out_har2)
+    exp_out_har2_scatP
+    ggsave(exp_out_har2_scatP[[1]], 
+           file=file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har2_scatP.pdf",sep = "")))
+
+    exp_out_har2_sinP<-mr_forest_plot(exp_out_har2_mrsin)
+    exp_out_har2_sinP
+    ggsave(exp_out_har2_sinP[[1]], 
+           file=file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har2_sinP.pdf",sep = "")))
+
+    exp_out_har2_looP<-mr_leaveoneout_plot(exp_out_har2_mrloo)
+    exp_out_har2_looP
+    ggsave(exp_out_har2_looP[[1]], 
+           file=file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har2_looP.pdf",sep = "")))
+
+    exp_out_har2_funnelP<-mr_funnel_plot(exp_out_har2_mrsin)
+    exp_out_har2_funnelP
+    ggsave(exp_out_har2_funnelP[[1]], 
+           file=file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har2_funnelP.pdf",sep = "")))
+
+    #combine_all_mrresults 
+    exp_out_har2_mrallres<-combine_all_mrresults(res = exp_out_har2_mrdeft, 
+                                           het= exp_out_har2_mrhet,
+                                           plt =exp_out_har2_mrplt,
+                                           sin = exp_out_har2_mrsin, 
+                                           ao_slc = FALSE)
+    write.csv(exp_out_har2_mrallres,file = 
+                file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har2_mr_allres.csv",sep = "")))
+
+    ##subset for rbind
+    exp_out_har2_mrsubres<-exp_out_har2_mrallres[-which(exp_out_har2_mrallres$Method==
+                                                          "Wald ratio"),]
+    exp_out_har2_mrsubres<-exp_out_har2_mrsubres[,c("Method","outcome","exposure",                              "nsnp","b","se","pval","Q","Q_df","Q_pval","intercept",                                   "intercept_se","intercept_pval","id.outcome","id.exposure")]
+    write.csv(exp_out_har2_mrsubres,file = 
+                file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har2_mr_subres.csv",sep = "")))
+
+    #add mr.raps for weak instrumental
+    exp_out_har2_mrraps<-mr.raps(b_exp = exp_out_har2$beta.exposure,
+                                 b_out = exp_out_har2$beta.outcome,
+                                 se_exp = exp_out_har2$se.exposure,
+                                 se_out = exp_out_har2$se.outcome)
+    write.csv(exp_out_har2_mrraps,file= 
+                file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har2_mr_rapsres.csv",sep = "")))
+
+    ##transform list to data.frame
+    exp_out_har2_mrraps_re<-as.data.frame(exp_out_har2_mrraps)
+
+    ##rename colnames to merge
+    setnames(exp_out_har2_mrraps_re,c("beta.hat","beta.se","beta.p.value"),
+             c("b","se","pval"))
+    exp_out_har2_mrraps_re$Method<-"MR RAPS"
+    exp_out_har2_mrraps_re$outcome<-as.character(sleep_table[i,'trait'])
+    exp_out_har2_mrraps_re$exposure<-as.character(id)
+    exp_out_har2_mrraps_re$nsnp<-exp_out_har2_mrdeft[1,"nsnp"]
+    exp_out_har2_mrraps_re$Q<-"NA"
+    exp_out_har2_mrraps_re$Q_df<-"NA"
+    exp_out_har2_mrraps_re$Q_pval<-"NA"
+    exp_out_har2_mrraps_re$intercept<-"NA"
+    exp_out_har2_mrraps_re$intercept_se<-"NA"
+    exp_out_har2_mrraps_re$intercept_pval<-"NA"
+    exp_out_har2_mrraps_re$id.outcome<-"NA"
+    exp_out_har2_mrraps_re$id.exposure<-"NA"
+    exp_out_har2_mrraps_re<-exp_out_har2_mrraps_re[,c("Method","outcome","exposure",                       "nsnp","b","se","pval","Q","Q_df","Q_pval","intercept","intercept_se",                                             "intercept_pval","id.outcome","id.exposure")]
+
+    #rbind mr results
+    exp_out_har2_mr_bindres<-rbind(exp_out_har2_mrsubres,exp_out_har2_mrraps_re)
+    exp_out_har2_mr_bindres$exp_out_har_pair=as.character(paste(id,                                                           sleep_table[i,'trait'],"har2",sep = "_"))
+    write.csv(exp_out_har2_mr_bindres,file = 
+                file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har2_mr_bindres.csv",sep = "")))
+    }else if(nrow(subset(exp_out_har2,mr_keep==TRUE))==1){
+      exp_out_har2_mr_bindres<-data.frame(Method=NA,outcome=NA,exposure=NA,nsnp=NA,                 b=NA,se=NA,pval=NA,Q=NA,Q_df=NA,Q_pval=NA,intercept=NA,intercept_se=NA,                   intercept_pval=NA,id.outcome=NA,id.exposure=NA,exp_out_har_pair=NA)
+      exp_out_har2_mrdeft<-mr(exp_out_har2)
+      exp_out_har2_mr_bindres[1,"Method"]<-exp_out_har2_mrdeft[1,"method"]
+      exp_out_har2_mr_bindres[1,"outcome"]<-exp_out_har2_mrdeft[1,"outcome"]
+      exp_out_har2_mr_bindres[1,"exposure"]<-exp_out_har2_mrdeft[1,"exposure"]
+      exp_out_har2_mr_bindres[1,"nsnp"]<-exp_out_har2_mrdeft[1,"nsnp"]
+      exp_out_har2_mr_bindres[1,"b"]<-exp_out_har2_mrdeft[1,"b"]
+      exp_out_har2_mr_bindres[1,"se"]<-exp_out_har2_mrdeft[1,"se"]
+      exp_out_har2_mr_bindres[1,"pval"]<-exp_out_har2_mrdeft[1,"pval"]
+      exp_out_har2_mr_bindres[1,"id.outcome"]<-exp_out_har2_mrdeft[1,"id.outcome"]
+      exp_out_har2_mr_bindres[1,"id.exposure"]<-exp_out_har2_mrdeft[1,"id.exposure"]
+      exp_out_har2_mr_bindres[1,"exp_out_har_pair"]=as.character(
+        paste(id,sleep_table[i,'trait'],"har2",sep = "_"))
+      write.csv(exp_out_har2_mr_bindres,file = 
+                file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har2_mr_bindres.csv",sep = "")))
+    }else{
+      exp_out_har2_mr_bindres<-data.frame(Method=NA,outcome=NA,exposure=NA,nsnp=NA,                 b=NA,se=NA,pval=NA,Q=NA,Q_df=NA,Q_pval=NA,intercept=NA,intercept_se=NA,                   intercept_pval=NA,id.outcome=NA,id.exposure=NA,exp_out_har_pair=NA)
+      exp_out_har2_mr_bindres[1,"Method"]<-"None"
+      exp_out_har2_mr_bindres[1,"outcome"]<-as.character(sleep_table[i,'trait'])
+      exp_out_har2_mr_bindres[1,"exposure"]<-as.character(id)
+      exp_out_har2_mr_bindres[1,"nsnp"]<-nrow(exp_out_har2)
+    }
+    
+    
+    ##har3_mr
+    #MR with default method=deft
+    if(nrow(subset(exp_out_har3,mr_keep==TRUE))>1){
+    exp_out_har3_mrdeft<-mr(exp_out_har3,method_list=                               
+                              c("mr_ivw","mr_egger_regression","mr_weighted_median"))
+    exp_out_har3_mrhet<-mr_heterogeneity(exp_out_har3)
+    exp_out_har3_mrplt<-mr_pleiotropy_test(exp_out_har3)
+    exp_out_har3_mrsin<-mr_singlesnp(exp_out_har3)
+    exp_out_har3_mrloo<-mr_leaveoneout(exp_out_har3)
+
+    #plots
+    exp_out_har3_scatP<-mr_scatter_plot(exp_out_har3_mrdeft,exp_out_har3)
+    exp_out_har3_scatP
+    ggsave(exp_out_har3_scatP[[1]], 
+           file=file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har3_scatP.pdf",sep = "")))
+
+    exp_out_har3_sinP<-mr_forest_plot(exp_out_har3_mrsin)
+    exp_out_har3_sinP
+    ggsave(exp_out_har3_sinP[[1]], 
+           file=file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har3_sinP.pdf",sep = "")))
+
+    exp_out_har3_looP<-mr_leaveoneout_plot(exp_out_har3_mrloo)
+    exp_out_har3_looP
+    ggsave(exp_out_har3_looP[[1]], 
+           file=file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har3_looP.pdf",sep = "")))
+
+    exp_out_har3_funnelP<-mr_funnel_plot(exp_out_har3_mrsin)
+    exp_out_har3_funnelP
+    ggsave(exp_out_har3_funnelP[[1]], 
+           file=file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har3_funnelP.pdf",sep = "")))
+
+    #combine_all_mrresults 
+    exp_out_har3_mrallres<-combine_all_mrresults(res = exp_out_har3_mrdeft, 
+                                           het= exp_out_har3_mrhet,
+                                           plt =exp_out_har3_mrplt,
+                                           sin = exp_out_har3_mrsin, 
+                                           ao_slc = FALSE)
+    write.csv(exp_out_har3_mrallres,file = 
+                file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har3_mr_allres.csv",sep = "")))
+
+    ##subset for rbind
+    exp_out_har3_mrsubres<-exp_out_har3_mrallres[-which(exp_out_har3_mrallres$Method==
+                                                          "Wald ratio"),]
+    exp_out_har3_mrsubres<-exp_out_har3_mrsubres[,c("Method","outcome","exposure",                              "nsnp","b","se","pval","Q","Q_df","Q_pval","intercept",                                   "intercept_se","intercept_pval","id.outcome","id.exposure")]
+    write.csv(exp_out_har3_mrsubres,file = 
+                file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har3_mr_subres.csv",sep = "")))
+
+    #add mr.raps for weak instrumental
+    exp_out_har3_mrraps<-mr.raps(b_exp = exp_out_har3$beta.exposure,
+                                 b_out = exp_out_har3$beta.outcome,
+                                 se_exp = exp_out_har3$se.exposure,
+                                 se_out = exp_out_har3$se.outcome)
+    write.csv(exp_out_har3_mrraps,file= 
+                file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har3_mr_rapsres.csv",sep = "")))
+
+    ##transform list to data.frame
+    exp_out_har3_mrraps_re<-as.data.frame(exp_out_har3_mrraps)
+
+    ##rename colnames to merge
+    setnames(exp_out_har3_mrraps_re,c("beta.hat","beta.se","beta.p.value"),
+             c("b","se","pval"))
+    exp_out_har3_mrraps_re$Method<-"MR RAPS"
+    exp_out_har3_mrraps_re$outcome<-as.character(sleep_table[i,'trait'])
+    exp_out_har3_mrraps_re$exposure<-as.character(id)
+    exp_out_har3_mrraps_re$nsnp<-exp_out_har3_mrdeft[1,"nsnp"]
+    exp_out_har3_mrraps_re$Q<-"NA"
+    exp_out_har3_mrraps_re$Q_df<-"NA"
+    exp_out_har3_mrraps_re$Q_pval<-"NA"
+    exp_out_har3_mrraps_re$intercept<-"NA"
+    exp_out_har3_mrraps_re$intercept_se<-"NA"
+    exp_out_har3_mrraps_re$intercept_pval<-"NA"
+    exp_out_har3_mrraps_re$id.outcome<-"NA"
+    exp_out_har3_mrraps_re$id.exposure<-"NA"
+    exp_out_har3_mrraps_re<-exp_out_har3_mrraps_re[,c("Method","outcome","exposure",                       "nsnp","b","se","pval","Q","Q_df","Q_pval","intercept","intercept_se",                                             "intercept_pval","id.outcome","id.exposure")]
+
+    #rbind mr results
+    exp_out_har3_mr_bindres<-rbind(exp_out_har3_mrsubres,exp_out_har3_mrraps_re)
+    exp_out_har3_mr_bindres$exp_out_har_pair=as.character(paste(id,                                                           sleep_table[i,'trait'],"har3",sep = "_"))
+    write.csv(exp_out_har3_mr_bindres,file = 
+                file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har3_mr_bindres.csv",sep = "")))
+    }else if(nrow(subset(exp_out_har3,mr_keep==TRUE))==1){
+      exp_out_har3_mr_bindres<-data.frame(Method=NA,outcome=NA,exposure=NA,nsnp=NA,                 b=NA,se=NA,pval=NA,Q=NA,Q_df=NA,Q_pval=NA,intercept=NA,intercept_se=NA,                   intercept_pval=NA,id.outcome=NA,id.exposure=NA,exp_out_har_pair=NA)
+      exp_out_har3_mrdeft<-mr(exp_out_har3)
+      exp_out_har3_mr_bindres[1,"Method"]<-exp_out_har3_mrdeft[1,"method"]
+      exp_out_har3_mr_bindres[1,"outcome"]<-exp_out_har3_mrdeft[1,"outcome"]
+      exp_out_har3_mr_bindres[1,"exposure"]<-exp_out_har3_mrdeft[1,"exposure"]
+      exp_out_har3_mr_bindres[1,"nsnp"]<-exp_out_har3_mrdeft[1,"nsnp"]
+      exp_out_har3_mr_bindres[1,"b"]<-exp_out_har3_mrdeft[1,"b"]
+      exp_out_har3_mr_bindres[1,"se"]<-exp_out_har3_mrdeft[1,"se"]
+      exp_out_har3_mr_bindres[1,"pval"]<-exp_out_har3_mrdeft[1,"pval"]
+      exp_out_har3_mr_bindres[1,"id.outcome"]<-exp_out_har3_mrdeft[1,"id.outcome"]
+      exp_out_har3_mr_bindres[1,"id.exposure"]<-exp_out_har3_mrdeft[1,"id.exposure"]
+      exp_out_har3_mr_bindres[1,"exp_out_har_pair"]=as.character(
+        paste(id,sleep_table[i,'trait'],"har3",sep = "_"))
+      write.csv(exp_out_har3_mr_bindres,file = 
+                file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har3_mr_bindres.csv",sep = "")))
+    }else{
+      exp_out_har3_mr_bindres<-data.frame(Method=NA,outcome=NA,exposure=NA,nsnp=NA,                 b=NA,se=NA,pval=NA,Q=NA,Q_df=NA,Q_pval=NA,intercept=NA,intercept_se=NA,                   intercept_pval=NA,id.outcome=NA,id.exposure=NA,exp_out_har_pair=NA)
+      exp_out_har3_mr_bindres[1,"Method"]<-"None"
+      exp_out_har3_mr_bindres[1,"outcome"]<-as.character(sleep_table[i,'trait'])
+      exp_out_har3_mr_bindres[1,"exposure"]<-as.character(id)
+      exp_out_har3_mr_bindres[1,"nsnp"]<-nrow(exp_out_har3)
+    }
+    
+    
+    ##bind all for each pair
+    all_mr_bindres<-rbind(exp_out_har1_mr_bindres,exp_out_har2_mr_bindres,
+                          exp_out_har3_mr_bindres)
+    write.csv(all_mr_bindres,file = 
+                file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har_mr_bindres.csv",sep = "")))
+    save.image(file = file.path(paste("mr_res/",id,"_",sleep_table[i,'trait'],"/",id,"_",
+                                sleep_table[i,'trait'],
+                                "_har_mr_bindres.RData",sep = "")))
+    
+    ##bind all
+    all_res<-rbind(all_res,all_mr_bindres)
+  }
+}
+
+#save all_res
+all_res<-all_res[-1,]
+write.csv(all_res,file = file.path(paste("mr_res/metabolite_sleep_mr_bindres.csv",
+                                         sep = "")))
+write.xlsx(all_res,file = file.path(paste("mr_res/metabolite_sleep_mr_bindres.xlsx",
+                                         sep = "")))
+```
+
+## 2. Sleep traits as exposure and metabolites as outcome
+
+```{r mr-02-01-prepare-data}
+# Source file: 2_circulation_sleep_and_metabolites_mr.Rmd
+file_dir <- metabolite_gwas_dir
+
+sleep_table<-read_excel(sleep_trait_file,sheet = "sleep_trait_exp")
+
+row_file<-data.frame(out_gwas_id=NA,out_all_row=NA,sleep_type=NA,clump1_row=NA,clump2_row=NA,clump3_row=NA,harmonise1_row=NA,harmonise2_row=NA,harmonise3_row=NA)
+
+start_id = 90199621
+end_id = 90201020
+```
+
+```{r mr-02-02-format-clump-sleep-exposures}
+# Source file: 2_circulation_sleep_and_metabolites_mr.Rmd
+for (i in 1:dim(sleep_table)[1]) {
+    load(file = resolve_sleep_resource(sleep_table[i, 'local_pselect_path']))
+    pselectdat<-dat_p5e8_hg19
+    rm(dat_p5e8_hg19)
+    
+    #format
+    sleep_format<-format_data(pselectdat,type = "exposure",header = TRUE,
+                      snps = NULL,snp_col = "SNP",
+                      pos_col = "BP",chr_col = "CHR",
+                      effect_allele_col = "Effect_Allele",
+                      other_allele_col = "Other_Allele",beta_col = "BETA",
+                      se_col = "BETA_SE",pval_col = "P",eaf_col = "EAF")
+    sleep_format$exposure<-as.character(sleep_table[i,'trait'])
+    
+    #clump
+    sleep_clump_temp<-sleep_format[,c("SNP","pval.exposure")]
+    pre_clump_data <- sleep_clump_temp %>% select(rsid = SNP,pval = pval.exposure)
+    
+    sleep_metabolite_clump1 <- ld_clump_local(pre_clump_data,
+                                        clump_kb = 1000,  
+                                        clump_r2 = 0.1,  
+                                        clump_p = 5*10^(-8),  
+                                        plink_bin = get_plink_exe(),  
+                                        bfile = ld_bfile) %>% {.$rsid}
+    clump1 <- subset(sleep_format, SNP %in% sleep_metabolite_clump1)
+      
+    sleep_metabolite_clump2 <- ld_clump_local(pre_clump_data,
+                                        clump_kb = 1000,  
+                                        clump_r2 = 0.01,  
+                                        clump_p = 5*10^(-8),  
+                                        plink_bin = get_plink_exe(),  
+                                        bfile = ld_bfile) %>% {.$rsid}
+    clump2 <- subset(sleep_format, SNP %in% sleep_metabolite_clump2)
+      
+    sleep_metabolite_clump3 <- ld_clump_local(pre_clump_data,
+                                        clump_kb = 10000,  
+                                        clump_r2 = 0.001,  
+                                        clump_p = 5*10^(-8),  
+                                        plink_bin = get_plink_exe(),  
+                                        bfile = ld_bfile) %>% {.$rsid}
+    clump3 <- subset(sleep_format, SNP %in% sleep_metabolite_clump3)
+    
+    save(clump1,file = file.path(paste("clump_data/",
+                                      sleep_table[i,"trait"],"_clump1.RData",sep = "")))
+    save(clump2,file = file.path(paste("clump_data/",
+                                      sleep_table[i,"trait"],"_clump2.RData",sep = "")))
+    save(clump3,file = file.path(paste("clump_data/",
+                                      sleep_table[i,"trait"],"_clump3.RData",sep = "")))
+}
+```
+
+```{r mr-02-03-harmonise-sleep-to-metabolites}
+# Source file: 2_circulation_sleep_and_metabolites_mr.Rmd
+r<-0
+for (id in start_id:end_id) {
+  r<-r+1
+  row_file[r,] <- NA
+  
+  #all_snp
+  metabolite<-fread(paste(file_dir,"GCST",id,".tsv.gz",sep = ""))
+  row_file[["out_gwas_id"]][r]<-id
+  row_file[["out_all_row"]][r]<-nrow(metabolite)
+  
+  #sleep for pselect
+  for (i in 1:dim(sleep_table)[1]) {
+    load(file = as.character(paste("clump_data/",
+                                      sleep_table[i,"trait"],"_clump1.RData",sep = "")))
+    load(file = as.character(paste("clump_data/",
+                                      sleep_table[i,"trait"],"_clump2.RData",sep = "")))
+    load(file = as.character(paste("clump_data/",
+                                      sleep_table[i,"trait"],"_clump3.RData",sep = "")))
+    
+    row_file[["sleep_type"]][r]<-as.character(sleep_table[i,"trait"])
+    
+    #outcome
+    out1<-format_data(metabolite,type = "outcome",header = TRUE,snps = clump1$SNP,
+                                 snp_col = "variant_id",chr_col = "chromosome",
+                                 pos_col = "base_pair_location",
+                                 effect_allele_col = "effect_allele",
+                                 other_allele_col = "other_allele",beta_col = "beta",
+                                 se_col = "standard_error",
+                                 eaf_col = "effect_allele_frequency",
+                                 pval_col = "p_value")
+    out1$outcome<-id
+    
+    out2<-format_data(metabolite,type = "outcome",header = TRUE,snps = clump2$SNP,
+                                 snp_col = "variant_id",chr_col = "chromosome",
+                                 pos_col = "base_pair_location",
+                                 effect_allele_col = "effect_allele",
+                                 other_allele_col = "other_allele",beta_col = "beta",
+                                 se_col = "standard_error",
+                                 eaf_col = "effect_allele_frequency",
+                                 pval_col = "p_value")
+    out2$outcome<-id
+    
+    out3<-format_data(metabolite,type = "outcome",header = TRUE,snps = clump3$SNP,
+                                 snp_col = "variant_id",chr_col = "chromosome",
+                                 pos_col = "base_pair_location",
+                                 effect_allele_col = "effect_allele",
+                                 other_allele_col = "other_allele",beta_col = "beta",
+                                 se_col = "standard_error",
+                                 eaf_col = "effect_allele_frequency",
+                                 pval_col = "p_value")
+    out3$outcome<-id
+    
+    
+    #harmonise
+    exp_out_har1<-harmonise_data(clump1,out1,action = 2)
+    row_file[["harmonise1_row"]][r]<-nrow(exp_out_har1)
+    exp_out_har2<-harmonise_data(clump2,out2,action = 2)
+    row_file[["harmonise2_row"]][r]<-nrow(exp_out_har2)
+    exp_out_har3<-harmonise_data(clump3,out3,action = 2)
+    row_file[["harmonise3_row"]][r]<-nrow(exp_out_har3)
+    
+    save(exp_out_har1,file = file.path(paste("harmonise_data/",
+                             sleep_table[i,'trait'],"_",id,"_har1.RData",sep = "")))
+    write.csv(exp_out_har1,file = file.path(paste("harmonise_data/",
+                             sleep_table[i,'trait'],"_",id,"_har1.csv",sep = "")))
+    save(exp_out_har2,file = file.path(paste("harmonise_data/",
+                             sleep_table[i,'trait'],"_",id,"_har2.RData",sep = "")))
+    write.csv(exp_out_har2,file = file.path(paste("harmonise_data/",
+                             sleep_table[i,'trait'],"_",id,"_har2.csv",sep = "")))
+    save(exp_out_har3,file = file.path(paste("harmonise_data/",
+                             sleep_table[i,'trait'],"_",id,"_har3.RData",sep = "")))
+    write.csv(exp_out_har3,file = file.path(paste("harmonise_data/",
+                             sleep_table[i,'trait'],"_",id,"_har3.csv",sep = "")))
+    
+    save(exp_out_har1,exp_out_har2,exp_out_har3,file = file.path(paste("harmonise_data/",
+                             sleep_table[i,'trait'],"_",id,"_har.RData",sep = "")))
+  
+    r<-r+1
+    row_file[r,] <- NA
+  }
+}
+#save file
+write.csv(row_file,file = file.path("sleep_metabolite_all_p5e8_p5e6_format_clump_har_row.csv"))
+```
+
+```{r mr-02-04-run-sleep-metabolite-mr}
+# Source file: 2_circulation_sleep_and_metabolites_mr.Rmd
+combine_all_mrresults <- function (res, het, plt, sin, ao_slc = T, Exp = F, split.exposure = F, split.outcome = F) 
+{
+    requireNamespace("plyr", quietly = TRUE)
+    het <- het[, c("id.exposure", "id.outcome", "method", "Q", 
+        "Q_df", "Q_pval")]
+       sin <- sin[grep("[:0-9:]", sin$SNP), ]
+    sin$method <- "Wald ratio"
+    names(sin)[names(sin) == "p"] <- "pval"
+    names(res)[names(res) == "method"] <- "Method"
+    names(het)[names(het) == "method"] <- "Method"
+    names(sin)[names(sin) == "method"] <- "Method"
+    res <- merge(res, het, by = c("id.outcome", "id.exposure", 
+        "Method"), all.x = T)
+    res <- plyr::rbind.fill(res, sin[, c("exposure", "outcome", 
+        "id.exposure", "id.outcome", "SNP", "b", "se", "pval", 
+        "Method")])
+    if (ao_slc) {
+        ao <- available_outcomes()
+        names(ao)[names(ao) == "nsnp"] <- "nsnps.outcome.array"
+        res <- merge(res, ao[, !names(ao) %in% c("unit", "priority", 
+            "sd", "path", "note", "filename", "access", "mr")], 
+            by.x = "id.outcome", by.y = "id")
+    }
+    res$nsnp[is.na(res$nsnp)] <- 1
+    for (i in unique(res$id.outcome)) {
+        Methods <- unique(res$Method[res$id.outcome == i])
+        Methods <- Methods[Methods != "Wald ratio"]
+        for (j in unique(Methods)) {
+            res$SNP[res$id.outcome == i & res$Method == j] <- 
+              paste(res$SNP[res$id.outcome == 
+                i & res$Method == "Wald ratio"], collapse = "; ")
+        }
+    }
+    if (Exp) {
+        res$or <- exp(res$b)
+        res$or_lci95 <- exp(res$b - res$se * 1.96)
+        res$or_uci95 <- exp(res$b + res$se * 1.96)
+    }
+    plt <- plt[, c("id.outcome", "id.exposure", "egger_intercept", 
+        "se", "pval")]
+    plt$Method <- "MR Egger"
+    names(plt)[names(plt) == "egger_intercept"] <- "intercept"
+    names(plt)[names(plt) == "se"] <- "intercept_se"
+    names(plt)[names(plt) == "pval"] <- "intercept_pval"
+    res <- merge(res, plt, by = c("id.outcome", "id.exposure", 
+        "Method"), all.x = T)
+    if (split.exposure) {
+        res <- split_exposure(res)
+    }
+    if (split.outcome) {
+        res <- split_outcome(res)
+    }
+    Cols <- c("Method", "outcome", "exposure", "nsnp", "b", "se", 
+        "pval", "intercept", "intercept_se", "intercept_pval", 
+        "Q", "Q_df", "Q_pval", "consortium", "ncase", "ncontrol", 
+        "pmid", "population")
+    res <- res[, c(names(res)[names(res) %in% Cols], names(res)[which(!names(res) %in% 
+        Cols)])]
+    return(res)
+}
+
+all_res<-data.frame(Method=NA,outcome=NA,exposure=NA,nsnp=NA,b=NA,se=NA,pval=NA,Q=NA,Q_df=NA,Q_pval=NA,intercept=NA,intercept_se=NA,intercept_pval=NA,id.outcome=NA,id.exposure=NA,exp_out_har_pair=NA)
+
+sleep_table<-read_excel(sleep_trait_file,sheet = "sleep_trait_exp")
+
+start_id = 90199621
+end_id = 90201020
+
+for (id in start_id:end_id) {
+  
+  for (i in 1:dim(sleep_table)[1]) {
+    
+    folder_path<-paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",sep = "")
+    dir.create(folder_path)
+    
+    load(paste("harmonise_data/",sleep_table[i,'trait'],"_",id,"_har.RData",sep = ""))
+    
+    ##har1_mr
+    #MR with default method=deft
+    if(nrow(subset(exp_out_har1,mr_keep==TRUE))>1){
+    exp_out_har1_mrdeft<-mr(exp_out_har1,method_list=                               
+                              c("mr_ivw","mr_egger_regression","mr_weighted_median"))
+    exp_out_har1_mrhet<-mr_heterogeneity(exp_out_har1)
+    exp_out_har1_mrplt<-mr_pleiotropy_test(exp_out_har1)
+    exp_out_har1_mrsin<-mr_singlesnp(exp_out_har1)
+    exp_out_har1_mrloo<-mr_leaveoneout(exp_out_har1)
+
+    #plots
+    exp_out_har1_scatP<-mr_scatter_plot(exp_out_har1_mrdeft,exp_out_har1)
+    exp_out_har1_scatP
+    ggsave(exp_out_har1_scatP[[1]], 
+           file=file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har1_scatP.pdf",sep = "")))
+
+    exp_out_har1_sinP<-mr_forest_plot(exp_out_har1_mrsin)
+    exp_out_har1_sinP
+    ggsave(exp_out_har1_sinP[[1]], 
+           file=file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har1_sinP.pdf",sep = "")))
+
+    exp_out_har1_looP<-mr_leaveoneout_plot(exp_out_har1_mrloo)
+    exp_out_har1_looP
+    ggsave(exp_out_har1_looP[[1]], 
+           file=file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har1_looP.pdf",sep = "")))
+
+    exp_out_har1_funnelP<-mr_funnel_plot(exp_out_har1_mrsin)
+    exp_out_har1_funnelP
+    ggsave(exp_out_har1_funnelP[[1]], 
+           file=file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har1_funnelP.pdf",sep = "")))
+
+    #combine_all_mrresults 
+    exp_out_har1_mrallres<-combine_all_mrresults(res = exp_out_har1_mrdeft, 
+                                           het= exp_out_har1_mrhet,
+                                           plt =exp_out_har1_mrplt,
+                                           sin = exp_out_har1_mrsin, 
+                                           ao_slc = FALSE)
+    write.csv(exp_out_har1_mrallres,file = 
+                file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har1_mr_allres.csv",sep = "")))
+
+    ##subset for rbind
+    exp_out_har1_mrsubres<-exp_out_har1_mrallres[-which(exp_out_har1_mrallres$Method==
+                                                          "Wald ratio"),]
+    exp_out_har1_mrsubres<-exp_out_har1_mrsubres[,c("Method","outcome","exposure",                              "nsnp","b","se","pval","Q","Q_df","Q_pval","intercept",                                   "intercept_se","intercept_pval","id.outcome","id.exposure")]
+    write.csv(exp_out_har1_mrsubres,file = 
+                file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har1_mr_subres.csv",sep = "")))
+
+    #add mr.raps for weak instrumental
+    exp_out_har1_mrraps<-mr.raps(b_exp = exp_out_har1$beta.exposure,
+                                 b_out = exp_out_har1$beta.outcome,
+                                 se_exp = exp_out_har1$se.exposure,
+                                 se_out = exp_out_har1$se.outcome)
+    write.csv(exp_out_har1_mrraps,file= 
+                file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har1_mr_rapsres.csv",sep = "")))
+
+    ##transform list to data.frame
+    exp_out_har1_mrraps_re<-as.data.frame(exp_out_har1_mrraps)
+
+    ##rename colnames to merge
+    setnames(exp_out_har1_mrraps_re,c("beta.hat","beta.se","beta.p.value"),
+             c("b","se","pval"))
+    exp_out_har1_mrraps_re$Method<-"MR RAPS"
+    exp_out_har1_mrraps_re$outcome<-as.character(id)
+    exp_out_har1_mrraps_re$exposure<-as.character(sleep_table[i,'trait'])
+    exp_out_har1_mrraps_re$nsnp<-"NA"
+    exp_out_har1_mrraps_re$Q<-"NA"
+    exp_out_har1_mrraps_re$Q_df<-"NA"
+    exp_out_har1_mrraps_re$Q_pval<-"NA"
+    exp_out_har1_mrraps_re$intercept<-"NA"
+    exp_out_har1_mrraps_re$intercept_se<-"NA"
+    exp_out_har1_mrraps_re$intercept_pval<-"NA"
+    exp_out_har1_mrraps_re$id.outcome<-"NA"
+    exp_out_har1_mrraps_re$id.exposure<-"NA"
+    exp_out_har1_mrraps_re<-exp_out_har1_mrraps_re[,c("Method","outcome","exposure",                       "nsnp","b","se","pval","Q","Q_df","Q_pval","intercept","intercept_se",                                             "intercept_pval","id.outcome","id.exposure")]
+
+    #rbind mr results
+    exp_out_har1_mr_bindres<-rbind(exp_out_har1_mrsubres,exp_out_har1_mrraps_re)
+    exp_out_har1_mr_bindres$exp_out_har_pair=as.character(paste(                                                           sleep_table[i,'trait'],id,"har1",sep = "_"))
+    write.csv(exp_out_har1_mr_bindres,file = 
+                file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har1_mr_bindres.csv",sep = "")))
+    }
+    else{
+      exp_out_har1_mr_bindres<-data.frame(Method=NA,outcome=NA,exposure=NA,nsnp=NA,                 b=NA,se=NA,pval=NA,Q=NA,Q_df=NA,Q_pval=NA,intercept=NA,intercept_se=NA,                   intercept_pval=NA,id.outcome=NA,id.exposure=NA,exp_out_har_pair=NA)
+    }
+    
+    
+    ##har2_mr
+    #MR with default method=deft
+    if(nrow(subset(exp_out_har2,mr_keep==TRUE))>1){
+    exp_out_har2_mrdeft<-mr(exp_out_har2,method_list=                               
+                              c("mr_ivw","mr_egger_regression","mr_weighted_median"))
+    exp_out_har2_mrhet<-mr_heterogeneity(exp_out_har2)
+    exp_out_har2_mrplt<-mr_pleiotropy_test(exp_out_har2)
+    exp_out_har2_mrsin<-mr_singlesnp(exp_out_har2)
+    exp_out_har2_mrloo<-mr_leaveoneout(exp_out_har2)
+
+    #plots
+    exp_out_har2_scatP<-mr_scatter_plot(exp_out_har2_mrdeft,exp_out_har2)
+    exp_out_har2_scatP
+    ggsave(exp_out_har2_scatP[[1]], 
+           file=file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har2_scatP.pdf",sep = "")))
+
+    exp_out_har2_sinP<-mr_forest_plot(exp_out_har2_mrsin)
+    exp_out_har2_sinP
+    ggsave(exp_out_har2_sinP[[1]], 
+           file=file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har2_sinP.pdf",sep = "")))
+
+    exp_out_har2_looP<-mr_leaveoneout_plot(exp_out_har2_mrloo)
+    exp_out_har2_looP
+    ggsave(exp_out_har2_looP[[1]], 
+           file=file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har2_looP.pdf",sep = "")))
+
+    exp_out_har2_funnelP<-mr_funnel_plot(exp_out_har2_mrsin)
+    exp_out_har2_funnelP
+    ggsave(exp_out_har2_funnelP[[1]], 
+           file=file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har2_funnelP.pdf",sep = "")))
+
+    #combine_all_mrresults 
+    exp_out_har2_mrallres<-combine_all_mrresults(res = exp_out_har2_mrdeft, 
+                                           het= exp_out_har2_mrhet,
+                                           plt =exp_out_har2_mrplt,
+                                           sin = exp_out_har2_mrsin, 
+                                           ao_slc = FALSE)
+    write.csv(exp_out_har2_mrallres,file = 
+                file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har2_mr_allres.csv",sep = "")))
+
+    ##subset for rbind
+    exp_out_har2_mrsubres<-exp_out_har2_mrallres[-which(exp_out_har2_mrallres$Method==
+                                                          "Wald ratio"),]
+    exp_out_har2_mrsubres<-exp_out_har2_mrsubres[,c("Method","outcome","exposure",                              "nsnp","b","se","pval","Q","Q_df","Q_pval","intercept",                                   "intercept_se","intercept_pval","id.outcome","id.exposure")]
+    write.csv(exp_out_har2_mrsubres,file = 
+                file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har2_mr_subres.csv",sep = "")))
+
+    #add mr.raps for weak instrumental
+    exp_out_har2_mrraps<-mr.raps(b_exp = exp_out_har2$beta.exposure,
+                                 b_out = exp_out_har2$beta.outcome,
+                                 se_exp = exp_out_har2$se.exposure,
+                                 se_out = exp_out_har2$se.outcome)
+    write.csv(exp_out_har2_mrraps,file= 
+                file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har2_mr_rapsres.csv",sep = "")))
+
+    ##transform list to data.frame
+    exp_out_har2_mrraps_re<-as.data.frame(exp_out_har2_mrraps)
+
+    ##rename colnames to merge
+    setnames(exp_out_har2_mrraps_re,c("beta.hat","beta.se","beta.p.value"),
+             c("b","se","pval"))
+    exp_out_har2_mrraps_re$Method<-"MR RAPS"
+    exp_out_har2_mrraps_re$outcome<-as.character(id)
+    exp_out_har2_mrraps_re$exposure<-as.character(sleep_table[i,'trait'])
+    exp_out_har2_mrraps_re$nsnp<-"NA"
+    exp_out_har2_mrraps_re$Q<-"NA"
+    exp_out_har2_mrraps_re$Q_df<-"NA"
+    exp_out_har2_mrraps_re$Q_pval<-"NA"
+    exp_out_har2_mrraps_re$intercept<-"NA"
+    exp_out_har2_mrraps_re$intercept_se<-"NA"
+    exp_out_har2_mrraps_re$intercept_pval<-"NA"
+    exp_out_har2_mrraps_re$id.outcome<-"NA"
+    exp_out_har2_mrraps_re$id.exposure<-"NA"
+    exp_out_har2_mrraps_re<-exp_out_har2_mrraps_re[,c("Method","outcome","exposure",                       "nsnp","b","se","pval","Q","Q_df","Q_pval","intercept","intercept_se",                                             "intercept_pval","id.outcome","id.exposure")]
+
+    #rbind mr results
+    exp_out_har2_mr_bindres<-rbind(exp_out_har2_mrsubres,exp_out_har2_mrraps_re)
+    exp_out_har2_mr_bindres$exp_out_har_pair=as.character(paste(                                                           sleep_table[i,'trait'],id,"har2",sep = "_"))
+    write.csv(exp_out_har2_mr_bindres,file = 
+                file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har2_mr_bindres.csv",sep = "")))
+    }
+    else{
+      exp_out_har2_mr_bindres<-data.frame(Method=NA,outcome=NA,exposure=NA,nsnp=NA,                 b=NA,se=NA,pval=NA,Q=NA,Q_df=NA,Q_pval=NA,intercept=NA,intercept_se=NA,                   intercept_pval=NA,id.outcome=NA,id.exposure=NA,exp_out_har_pair=NA)
+    }
+    
+    
+    ##har3_mr
+    #MR with default method=deft
+    if(nrow(subset(exp_out_har3,mr_keep==TRUE))>1){
+    exp_out_har3_mrdeft<-mr(exp_out_har3,method_list=                               
+                              c("mr_ivw","mr_egger_regression","mr_weighted_median"))
+    exp_out_har3_mrhet<-mr_heterogeneity(exp_out_har3)
+    exp_out_har3_mrplt<-mr_pleiotropy_test(exp_out_har3)
+    exp_out_har3_mrsin<-mr_singlesnp(exp_out_har3)
+    exp_out_har3_mrloo<-mr_leaveoneout(exp_out_har3)
+
+    #plots
+    exp_out_har3_scatP<-mr_scatter_plot(exp_out_har3_mrdeft,exp_out_har3)
+    exp_out_har3_scatP
+    ggsave(exp_out_har3_scatP[[1]], 
+           file=file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har3_scatP.pdf",sep = "")))
+
+    exp_out_har3_sinP<-mr_forest_plot(exp_out_har3_mrsin)
+    exp_out_har3_sinP
+    ggsave(exp_out_har3_sinP[[1]], 
+           file=file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har3_sinP.pdf",sep = "")))
+
+    exp_out_har3_looP<-mr_leaveoneout_plot(exp_out_har3_mrloo)
+    exp_out_har3_looP
+    ggsave(exp_out_har3_looP[[1]], 
+           file=file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har3_looP.pdf",sep = "")))
+
+    exp_out_har3_funnelP<-mr_funnel_plot(exp_out_har3_mrsin)
+    exp_out_har3_funnelP
+    ggsave(exp_out_har3_funnelP[[1]], 
+           file=file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har3_funnelP.pdf",sep = "")))
+
+    #combine_all_mrresults 
+    exp_out_har3_mrallres<-combine_all_mrresults(res = exp_out_har3_mrdeft, 
+                                           het= exp_out_har3_mrhet,
+                                           plt =exp_out_har3_mrplt,
+                                           sin = exp_out_har3_mrsin, 
+                                           ao_slc = FALSE)
+    write.csv(exp_out_har3_mrallres,file = 
+                file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har3_mr_allres.csv",sep = "")))
+
+    ##subset for rbind
+    exp_out_har3_mrsubres<-exp_out_har3_mrallres[-which(exp_out_har3_mrallres$Method==
+                                                          "Wald ratio"),]
+    exp_out_har3_mrsubres<-exp_out_har3_mrsubres[,c("Method","outcome","exposure",                              "nsnp","b","se","pval","Q","Q_df","Q_pval","intercept",                                   "intercept_se","intercept_pval","id.outcome","id.exposure")]
+    write.csv(exp_out_har3_mrsubres,file = 
+                file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har3_mr_subres.csv",sep = "")))
+
+    #add mr.raps for weak instrumental
+    exp_out_har3_mrraps<-mr.raps(b_exp = exp_out_har3$beta.exposure,
+                                 b_out = exp_out_har3$beta.outcome,
+                                 se_exp = exp_out_har3$se.exposure,
+                                 se_out = exp_out_har3$se.outcome)
+    write.csv(exp_out_har3_mrraps,file= 
+                file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har3_mr_rapsres.csv",sep = "")))
+
+    ##transform list to data.frame
+    exp_out_har3_mrraps_re<-as.data.frame(exp_out_har3_mrraps)
+
+    ##rename colnames to merge
+    setnames(exp_out_har3_mrraps_re,c("beta.hat","beta.se","beta.p.value"),
+             c("b","se","pval"))
+    exp_out_har3_mrraps_re$Method<-"MR RAPS"
+    exp_out_har3_mrraps_re$outcome<-as.character(id)
+    exp_out_har3_mrraps_re$exposure<-as.character(sleep_table[i,'trait'])
+    exp_out_har3_mrraps_re$nsnp<-"NA"
+    exp_out_har3_mrraps_re$Q<-"NA"
+    exp_out_har3_mrraps_re$Q_df<-"NA"
+    exp_out_har3_mrraps_re$Q_pval<-"NA"
+    exp_out_har3_mrraps_re$intercept<-"NA"
+    exp_out_har3_mrraps_re$intercept_se<-"NA"
+    exp_out_har3_mrraps_re$intercept_pval<-"NA"
+    exp_out_har3_mrraps_re$id.outcome<-"NA"
+    exp_out_har3_mrraps_re$id.exposure<-"NA"
+    exp_out_har3_mrraps_re<-exp_out_har3_mrraps_re[,c("Method","outcome","exposure",                       "nsnp","b","se","pval","Q","Q_df","Q_pval","intercept","intercept_se",                                             "intercept_pval","id.outcome","id.exposure")]
+
+    #rbind mr results
+    exp_out_har3_mr_bindres<-rbind(exp_out_har3_mrsubres,exp_out_har3_mrraps_re)
+    exp_out_har3_mr_bindres$exp_out_har_pair=as.character(paste(                                                           sleep_table[i,'trait'],id,"har3",sep = "_"))
+    write.csv(exp_out_har3_mr_bindres,file = 
+                file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har3_mr_bindres.csv",sep = "")))
+    }
+    else{
+      exp_out_har3_mr_bindres<-data.frame(Method=NA,outcome=NA,exposure=NA,nsnp=NA,                 b=NA,se=NA,pval=NA,Q=NA,Q_df=NA,Q_pval=NA,intercept=NA,intercept_se=NA,                   intercept_pval=NA,id.outcome=NA,id.exposure=NA,exp_out_har_pair=NA)
+    }
+    
+    
+    ##bind all for each pair
+    all_mr_bindres<-rbind(exp_out_har1_mr_bindres,exp_out_har2_mr_bindres,
+                          exp_out_har3_mr_bindres)
+    write.csv(all_mr_bindres,file = 
+                file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har_mr_bindres.csv",sep = "")))
+    save.image(file = file.path(paste("mr_res/",sleep_table[i,'trait'],"_",id,"/",
+                                sleep_table[i,'trait'],"_",id,
+                                "_har_mr_bindres.RData",sep = "")))
+    
+    ##bind all
+    all_res<-rbind(all_res,all_mr_bindres)
+  }
+}
+
+#save all_res
+all_res<-all_res[-1,]
+write.csv(all_res,file = file.path(paste("mr_res/sleep_metabolite_mr_bindres.csv",
+                                         sep = "")))
+```
+
+## 3. Pathway annotation, multiple-testing correction, and metabolite-sleep result tables
+
+```{r mr-03-01-load-gwas-catalog}
+# Source file: 3_FDR_metabolite_sleep_table.Rmd
+catalog <- fread(catalog_file)
+
+catalog<-subset(catalog,catalog$firstAuthor=="Chen Y")
+catalog<-subset(catalog,catalog$pubmedId=="36635386")
+
+catalog$Ancestry<- sapply(catalog$discoverySampleAncestry,function(x){
+        temp <- strsplit(x, split = " ")[[1]][2]
+				return(as.character(temp))	
+				})
+catalog<-subset(catalog,catalog$Ancestry=="European")
+
+catalog$exposure<- sapply(catalog$accessionId,function(x){
+        temp <- strsplit(x, split = "GCST")[[1]][2]
+				return(as.character(temp))	
+				})
+
+catalog<-catalog[,c("exposure","reportedTrait")]
+```
+
+```{r mr-03-02-merge-mr-with-catalog}
+# Source file: 3_FDR_metabolite_sleep_table.Rmd
+all_res<-read_excel(file.path(mr_output_dir, "mr_res", "metabolite_sleep_mr_bindres.xlsx"), sheet = "Sheet 1")
+
+all_res<-merge(all_res,catalog,by="exposure")
+```
+
+```{r mr-03-03-bind-pathway-annotation}
+# Source file: 3_FDR_metabolite_sleep_table.Rmd
+metabolite_pathway<-read_excel(pathway_file, sheet = "Sheet1")
+
+all_res$reportedTrait<-gsub('levels','',all_res$reportedTrait)
+all_res$reportedTrait<-gsub('ratio','',all_res$reportedTrait)
+all_res$reportedTrait<-gsub('(Biocrates platform)','',all_res$reportedTrait)
+all_res$reportedTrait<-gsub('(Metabolon platform)','',all_res$reportedTrait)
+
+all_res$metabolite<-gsub("[(.*)]","",all_res$reportedTrait)
+all_res$metabolite<-gsub('[/]','to',all_res$metabolite)
+all_res$metabolite<-gsub('[-]','',all_res$metabolite)
+all_res$metabolite<-gsub(' ','',all_res$metabolite)
+
+metabolite_pathway$metabolite<-gsub("[(.*)]","",metabolite_pathway$metabolite)
+metabolite_pathway$metabolite<-gsub('[*]','',metabolite_pathway$metabolite)
+metabolite_pathway$metabolite<-gsub('[/]','to',metabolite_pathway$metabolite)
+metabolite_pathway$metabolite<-gsub('[-]','',metabolite_pathway$metabolite)
+
+metabolite_pathway$metabolite<-gsub(' ','',metabolite_pathway$metabolite)
+
+metabolite_pathway$metabolite<-tolower(metabolite_pathway$metabolite)
+all_res$metabolite<-tolower(all_res$metabolite)
+
+all_res_pathway<-merge(all_res,metabolite_pathway,by="metabolite")
+
+# Remove the temporary metabolite key column
+all_res_pathway<-all_res_pathway[,-which(colnames(all_res_pathway) == "metabolite")]
+```
+
+```{r mr-03-04-select-har3-and-apply-fdr}
+# Source file: 3_FDR_metabolite_sleep_table.Rmd
+# Select results from the third harmonization scheme (har3)
+all_res_pathway$har<- sapply(all_res_pathway$exp_out_har_pair,function(x){
+        temp <- lapply(strsplit(x, split = "_"), tail , 1 )
+				return(as.character(temp))	
+				})
+all_res_pathway<-subset(all_res_pathway,all_res_pathway$har=="har3")
+
+# Rename columns and remove spaces from column names
+all_res_pathway<-setnames(all_res_pathway,c("super pathway","sub pathway","gene for shared protein","protein names"),c("super_pathway","sub_pathway","gene_shared_protein","protein_names"))
+
+# Add analysis columns required for later merging
+all_res_pathway<-data.frame(all_res_pathway,pfdr_method=NA,pfdr_sleepmethod=NA,pbof_method=NA,pbof_sleepmethod=NA)
+
+all_res_pathway<-subset(all_res_pathway,all_res_pathway$outcome!="AHI")
+all_res_pathway<-subset(all_res_pathway,all_res_pathway$outcome!="daytimesleepiness")
+all_res_pathway<-subset(all_res_pathway,all_res_pathway$outcome!="snoringMain")
+
+# Initialize an empty result table
+all_res_fdr<-data.frame(Method=NA,exposure=NA,reportedTrait=NA,outcome=NA,nsnp=NA,b=NA,se=NA,pval=NA,pfdr_method=NA,pfdr_sleepmethod=NA,pbof_method=NA,pbof_sleepmethod=NA,Q=NA,Q_df=NA,Q_pval=NA,intercept=NA,intercept_se=NA,intercept_pval=NA,id.exposure=NA,id.outcome=NA,exp_out_har_pair=NA,super_pathway=NA,sub_pathway=NA,gene_shared_protein=NA,protein_names=NA,har=NA)
+
+# Apply multiple-testing correction in a loop
+  for (mtd in c("Inverse variance weighted","MR Egger","Weighted median","MR RAPS")) {
+    
+    if(mtd=="Inverse variance weighted"){
+      temp<-subset(all_res_pathway, Method == "Wald ratio")
+      temp_1mtd<- subset(all_res_pathway, Method == mtd)
+      temp_1mtd<-rbind(temp_1mtd,temp)
+    }else{
+      temp_1mtd<- subset(all_res_pathway, Method == mtd)
+    }
+    
+    #bonfferoni
+    if(nrow(subset(temp_1mtd,temp_1mtd$pval<0.05/length(temp_1mtd$pval)))>0){
+      a<-subset(temp_1mtd,temp_1mtd$pval<0.05/length(temp_1mtd$pval))
+      a$pbof_method<-0.05/length(temp_1mtd$pval)
+      b<-subset(temp_1mtd,temp_1mtd$pval>=0.05/length(temp_1mtd$pval))
+      b$pbof_method<-"/"
+      temp_1mtd<-rbind(a,b)
+    }else{
+      temp_1mtd$pbof_method<-"/"
+    }
+    
+    #fdr
+    temp_1mtd$pfdr_method<-p.adjust(temp_1mtd$pval,method = "fdr",
+                                   n = length(temp_1mtd$pval))
+    
+    #bind
+    all_res_fdr<-rbind(all_res_fdr,temp_1mtd)
+  }
+
+all_res_fdr<-all_res_fdr[-1,]
+all_res<-all_res_fdr
+all_res_fdr<-data.frame(Method=NA,exposure=NA,reportedTrait=NA,outcome=NA,nsnp=NA,b=NA,se=NA,pval=NA,pfdr_method=NA,pfdr_sleepmethod=NA,pbof_method=NA,pbof_sleepmethod=NA,Q=NA,Q_df=NA,Q_pval=NA,intercept=NA,intercept_se=NA,intercept_pval=NA,id.exposure=NA,id.outcome=NA,exp_out_har_pair=NA,super_pathway=NA,sub_pathway=NA,gene_shared_protein=NA,protein_names=NA,har=NA)
+
+for (sleep in c("OSA","daytimesleepiness_adjBMI","sleepduration","longsleepduration","shortsleepduration","insomnia","snoringadjBMI","chronotype","morning_person","napping")) {
+  for (mtd in c("Inverse variance weighted","MR Egger","Weighted median","MR RAPS")) {
+    temp_1slp_1mtd<- subset(all_res, outcome == sleep)
+    if(mtd=="Inverse variance weighted"){
+      temp<-subset(temp_1slp_1mtd, Method == "Wald ratio")
+      temp_1slp_1mtd<- subset(temp_1slp_1mtd, Method == mtd)
+      temp_1slp_1mtd<-rbind(temp_1slp_1mtd,temp)
+    }else{
+      temp_1slp_1mtd<- subset(temp_1slp_1mtd, Method == mtd)
+    }
+    
+    #bonfferoni
+    if(nrow(subset(temp_1slp_1mtd,temp_1slp_1mtd$pval<
+                   0.05/length(temp_1slp_1mtd$pval)))>0){
+      a<-subset(temp_1slp_1mtd,temp_1slp_1mtd$pval<0.05/length(temp_1slp_1mtd$pval))
+      a$pbof_sleepmethod<-0.05/length(temp_1slp_1mtd$pval)
+      b<-subset(temp_1slp_1mtd,temp_1slp_1mtd$pval>=0.05/length(temp_1slp_1mtd$pval))
+      b$pbof_sleepmethod<-"/"
+      temp_1slp_1mtd<-rbind(a,b)
+    }else{
+      temp_1slp_1mtd$pbof_sleepmethod<-"/"
+    }
+    
+    #fdr
+    temp_1slp_1mtd$pfdr_sleepmethod<-p.adjust(temp_1slp_1mtd$pval,method = "fdr",
+                                   n = length(temp_1slp_1mtd$pval))
+    
+    #bind
+    all_res_fdr<-rbind(all_res_fdr,temp_1slp_1mtd)
+    }
+}
+
+all_res_fdr<-all_res_fdr[-1,]
+all_res<-all_res_fdr
+```
+
+```{r mr-03-05-bind-hmdb-and-ultimate-traits}
+# Source file: 3_FDR_metabolite_sleep_table.Rmd
+metabolite_HMDBID<-read_excel(hmdb_file, sheet = "Sheet1")
+
+all_res$metabolite<-gsub("[(.*)]","",all_res$reportedTrait)
+all_res$metabolite<-gsub('[/]','to',all_res$metabolite)
+all_res$metabolite<-gsub('[-]','',all_res$metabolite)
+all_res$metabolite<-gsub(' ','',all_res$metabolite)
+
+metabolite_HMDBID$metabolite<-gsub("[(.*)]","",metabolite_HMDBID$metabolite)
+metabolite_HMDBID$metabolite<-gsub('[*]','',metabolite_HMDBID$metabolite)
+metabolite_HMDBID$metabolite<-gsub('[/]','to',metabolite_HMDBID$metabolite)
+metabolite_HMDBID$metabolite<-gsub('[-]','',metabolite_HMDBID$metabolite)
+
+metabolite_HMDBID$metabolite<-gsub(' ','',metabolite_HMDBID$metabolite)
+
+metabolite_HMDBID$metabolite<-tolower(metabolite_HMDBID$metabolite)
+all_res$metabolite<-tolower(all_res$metabolite)
+
+all_res_HMDBID<-merge(all_res,metabolite_HMDBID,by="metabolite",all.x = TRUE)
+# Remove the temporary metabolite key column
+all_res_HMDBID<-all_res_HMDBID[,-which(colnames(all_res_HMDBID) == "metabolite")]
+
+# Add the original metabolite names
+metabolite_ulttrait<-read_excel(ultimate_trait_file, sheet = "Sheet 1")
+
+metabolite_ulttrait$ult_trait<-sub("(.)","\\U\\1",metabolite_ulttrait$ult_trait,perl=TRUE)
+
+all_res_HMDBID<-merge(all_res_HMDBID,metabolite_ulttrait,by="exposure")
+
+# Sort by metabolite, sleep trait, and MR method
+# Initialize an empty result table
+all_res_ult<-data.frame(Method=NA,exposure=NA,reportedTrait=NA,outcome=NA,nsnp=NA,b=NA,se=NA,pval=NA,pfdr_method=NA,pfdr_sleepmethod=NA,pbof_method=NA,pbof_sleepmethod=NA,Q=NA,Q_df=NA,Q_pval=NA,intercept=NA,intercept_se=NA,intercept_pval=NA,id.exposure=NA,id.outcome=NA,exp_out_har_pair=NA,super_pathway=NA,sub_pathway=NA,gene_shared_protein=NA,protein_names=NA,har=NA,ult_trait=NA,HMDB_curated=NA)
+
+for (id in sort(unique(all_res$exposure))) {
+  temp<-subset(all_res_HMDBID,all_res_HMDBID$exposure==id)
+  for (sl in unique(all_res$outcome)) {
+    temp1<-subset(temp,temp$outcome==sl)
+    for (mt in unique(all_res$Method)) {
+      temp2<-subset(temp1,temp1$Method==mt)
+      
+      all_res_ult<-rbind(all_res_ult,temp2)
+    }
+  }
+}
+all_res_ult<-all_res_ult[-1,]
+
+# Calculate beta, OR, and 95% confidence intervals
+all_res_ult$BETA<-paste(round(all_res_ult$b,3),"(",round(all_res_ult$b-1.96*all_res_ult$se,3),"-",round(all_res_ult$b+1.96*all_res_ult$se,3),")",sep = "")
+
+all_res_ult$OR<-paste(round(exp(all_res_ult$b),3),"(",round(exp(all_res_ult$b-1.96*all_res_ult$se),3),"-",round(exp(all_res_ult$b+1.96*all_res_ult$se),3),")",sep = "")
+
+setnames(all_res_ult,c("BETA","OR"),c("Beta (95% CI)","OR (95% CI)"))
+
+all_res_ult$Q<-as.double(all_res_ult$Q)
+all_res_ult$Q_df<-as.double(all_res_ult$Q_df)
+all_res_ult$Q_pval<-as.double(all_res_ult$Q_pval)
+all_res_ult$intercept<-as.double(all_res_ult$intercept)
+all_res_ult$intercept_se<-as.double(all_res_ult$intercept_se)
+all_res_ult$intercept_pval<-as.double(all_res_ult$intercept_pval)
+
+write.xlsx(all_res_ult,file = file.path(mr_output_dir, "ult_har3_all_metabolite_sleep_mr_bindres_pathway_HMDBID_ulttrait.xlsx"))
+
+temp<-subset(all_res_ult,all_res_ult$Method=="Wald ratio")
+res_ult_sig<-subset(all_res_ult,all_res_ult$Method=="Inverse variance weighted")
+res_ult_sig<-subset(res_ult_sig,res_ult_sig$Q_pval>0.05)
+res_ult_sig<-rbind(res_ult_sig,temp)
+
+write.xlsx(subset(res_ult_sig,res_ult_sig$pfdr_method<0.05),file = file.path(mr_output_dir, "metabolite_sleep_primary_fdrmethod0.05.xlsx"))
+
+write.xlsx(subset(res_ult_sig,res_ult_sig$pfdr_sleepmethod<0.05),file = file.path(mr_output_dir, "metabolite_sleep_primary_fdrsleepmethod0.05.xlsx"))
+
+write.xlsx(subset(res_ult_sig,res_ult_sig$pbof_method!="/"),file = file.path(mr_output_dir, "metabolite_sleep_primary_bofmethod0.05.xlsx"))
+
+write.xlsx(subset(res_ult_sig,res_ult_sig$pbof_sleepmethod!="/"),file = file.path(mr_output_dir, "metabolite_sleep_primary_bofsleepmethod0.05.xlsx"))
+```
+
+## 4. Pathway annotation, multiple-testing correction, and sleep-metabolite result tables
+
+```{r mr-04-01-load-mr-results}
+# Source file: 4_FDR_sleep_metabolite_table.Rmd
+all_res<-read_excel(file.path(mr_output_dir, "mr_res", "sleep_metabolite_mr_bindres.xlsx"), sheet = "Sheet 1")
+```
+
+```{r mr-04-02-bind-pathway-annotation}
+# Source file: 4_FDR_sleep_metabolite_table.Rmd
+metabolite_pathway<-read_excel(pathway_file, sheet = "Sheet1")
+
+all_res$reportedTrait<-gsub('levels','',all_res$reportedTrait)
+all_res$reportedTrait<-gsub('ratio','',all_res$reportedTrait)
+all_res$reportedTrait<-gsub('(Biocrates platform)','',all_res$reportedTrait)
+all_res$reportedTrait<-gsub('(Metabolon platform)','',all_res$reportedTrait)
+
+all_res$metabolite<-gsub("[(.*)]","",all_res$reportedTrait)
+all_res$metabolite<-gsub('[/]','to',all_res$metabolite)
+all_res$metabolite<-gsub('[-]','',all_res$metabolite)
+all_res$metabolite<-gsub(' ','',all_res$metabolite)
+
+metabolite_pathway$metabolite<-gsub("[(.*)]","",metabolite_pathway$metabolite)
+metabolite_pathway$metabolite<-gsub('[*]','',metabolite_pathway$metabolite)
+metabolite_pathway$metabolite<-gsub('[/]','to',metabolite_pathway$metabolite)
+metabolite_pathway$metabolite<-gsub('[-]','',metabolite_pathway$metabolite)
+
+metabolite_pathway$metabolite<-gsub(' ','',metabolite_pathway$metabolite)
+
+metabolite_pathway$metabolite<-tolower(metabolite_pathway$metabolite)
+all_res$metabolite<-tolower(all_res$metabolite)
+
+all_res_pathway<-merge(all_res,metabolite_pathway,by="metabolite")
+
+# Remove the temporary metabolite key column
+all_res_pathway<-all_res_pathway[,-which(colnames(all_res_pathway) == "metabolite")]
+```
+
+```{r mr-04-03-select-har3-and-apply-fdr}
+# Source file: 4_FDR_sleep_metabolite_table.Rmd
+# Select results from the first harmonization scheme (har1)
+all_res_pathway$har<- sapply(all_res_pathway$exp_out_har_pair,function(x){
+        temp <- lapply(strsplit(x, split = "_"), tail , 1 )
+				return(as.character(temp))	
+				})
+all_res_pathway<-subset(all_res_pathway,all_res_pathway$har=="har3")
+
+# Rename columns and remove spaces from column names
+all_res_pathway<-setnames(all_res_pathway,c("super pathway","sub pathway","gene for shared protein","protein names"),c("super_pathway","sub_pathway","gene_shared_protein","protein_names"))
+
+# Add analysis columns required for later merging
+all_res_pathway<-data.frame(all_res_pathway,pfdr_method=NA,pfdr_sleepmethod=NA,pbof_method=NA,pbof_sleepmethod=NA)
+
+all_res_pathway<-subset(all_res_pathway,all_res_pathway$exposure!="AHI")
+all_res_pathway<-subset(all_res_pathway,all_res_pathway$exposure!="daytimesleepiness")
+all_res_pathway<-subset(all_res_pathway,all_res_pathway$exposure!="snoring")
+
+# Initialize an empty result table
+all_res_fdr<-data.frame(Method=NA,exposure=NA,reportedTrait=NA,outcome=NA,nsnp=NA,b=NA,se=NA,pval=NA,pfdr_method=NA,pfdr_sleepmethod=NA,pbof_method=NA,pbof_sleepmethod=NA,Q=NA,Q_df=NA,Q_pval=NA,intercept=NA,intercept_se=NA,intercept_pval=NA,id.exposure=NA,id.outcome=NA,exp_out_har_pair=NA,super_pathway=NA,sub_pathway=NA,gene_shared_protein=NA,protein_names=NA,har=NA)
+
+# Apply multiple-testing correction in a loop
+for (mtd in c("Inverse variance weighted","MR Egger","Weighted median","MR RAPS")) {
+
+    temp_1mtd<- subset(all_res_pathway, Method == mtd)
+    
+    #bonfferoni
+    if(nrow(subset(temp_1mtd,temp_1mtd$pval<0.05/length(temp_1mtd$pval)))>0){
+      a<-subset(temp_1mtd,temp_1mtd$pval<0.05/length(temp_1mtd$pval))
+      a$pbof_method<-0.05/length(temp_1mtd$pval)
+      b<-subset(temp_1mtd,temp_1mtd$pval>=0.05/length(temp_1mtd$pval))
+      b$pbof_method<-"/"
+      temp_1mtd<-rbind(a,b)
+    }else{
+      temp_1mtd$pbof_method<-"/"
+    }
+    
+    #fdr
+    temp_1mtd$pfdr_method<-p.adjust(temp_1mtd$pval,method = "fdr",
+                                   n = length(temp_1mtd$pval))
+    
+    #bind
+    all_res_fdr<-rbind(all_res_fdr,temp_1mtd)
+}
+
+all_res_fdr<-all_res_fdr[-1,]
+all_res<-all_res_fdr
+all_res_fdr<-data.frame(Method=NA,exposure=NA,reportedTrait=NA,outcome=NA,nsnp=NA,b=NA,se=NA,pval=NA,pfdr_method=NA,pfdr_sleepmethod=NA,pbof_method=NA,pbof_sleepmethod=NA,Q=NA,Q_df=NA,Q_pval=NA,intercept=NA,intercept_se=NA,intercept_pval=NA,id.exposure=NA,id.outcome=NA,exp_out_har_pair=NA,super_pathway=NA,sub_pathway=NA,gene_shared_protein=NA,protein_names=NA,har=NA)
+
+for (sleep in c("OSA","daytimesleepiness_adjBMI","sleepduration","longsleepduration","shortsleepduration","insomnia","snoring_adjBMI","chronotype","morning_person","napping")) {
+  for (mtd in c("Inverse variance weighted","MR Egger","Weighted median","MR RAPS")) {
+    temp_1slp_1mtd<- subset(all_res, exposure == sleep)
+    temp_1slp_1mtd<- subset(temp_1slp_1mtd, Method == mtd)
+    
+    #bonfferoni
+    if(nrow(subset(temp_1slp_1mtd,temp_1slp_1mtd$pval<
+                   0.05/length(temp_1slp_1mtd$pval)))>0){
+      a<-subset(temp_1slp_1mtd,temp_1slp_1mtd$pval<0.05/length(temp_1slp_1mtd$pval))
+      a$pbof_sleepmethod<-0.05/length(temp_1slp_1mtd$pval)
+      b<-subset(temp_1slp_1mtd,temp_1slp_1mtd$pval>=0.05/length(temp_1slp_1mtd$pval))
+      b$pbof_sleepmethod<-"/"
+      temp_1slp_1mtd<-rbind(a,b)
+    }else{
+      temp_1slp_1mtd$pbof_sleepmethod<-"/"
+    }
+    
+    #fdr
+    temp_1slp_1mtd$pfdr_sleepmethod<-p.adjust(temp_1slp_1mtd$pval,method = "fdr",
+                                                    n = length(temp_1slp_1mtd$pval))
+    
+    #bind
+    all_res_fdr<-rbind(all_res_fdr,temp_1slp_1mtd)
+  }
+}
+
+all_res_fdr<-all_res_fdr[-1,]
+all_res<-all_res_fdr
+```
+
+```{r mr-04-04-bind-hmdb-ultimate-traits-and-sample-size}
+# Source file: 4_FDR_sleep_metabolite_table.Rmd
+metabolite_HMDBID<-read_excel(hmdb_file, sheet = "Sheet1")
+
+all_res$metabolite<-gsub("[(.*)]","",all_res$reportedTrait)
+all_res$metabolite<-gsub('[/]','to',all_res$metabolite)
+all_res$metabolite<-gsub('[-]','',all_res$metabolite)
+all_res$metabolite<-gsub(' ','',all_res$metabolite)
+
+metabolite_HMDBID$metabolite<-gsub("[(.*)]","",metabolite_HMDBID$metabolite)
+metabolite_HMDBID$metabolite<-gsub('[*]','',metabolite_HMDBID$metabolite)
+metabolite_HMDBID$metabolite<-gsub('[/]','to',metabolite_HMDBID$metabolite)
+metabolite_HMDBID$metabolite<-gsub('[-]','',metabolite_HMDBID$metabolite)
+
+metabolite_HMDBID$metabolite<-gsub(' ','',metabolite_HMDBID$metabolite)
+
+metabolite_HMDBID$metabolite<-tolower(metabolite_HMDBID$metabolite)
+all_res$metabolite<-tolower(all_res$metabolite)
+
+all_res_HMDBID<-merge(all_res,metabolite_HMDBID,by="metabolite",all.x = TRUE)
+# Remove the temporary metabolite key column
+all_res_HMDBID<-all_res_HMDBID[,-which(colnames(all_res_HMDBID) == "metabolite")]
+
+# Add the original metabolite names
+metabolite_ulttrait<-read_excel(ultimate_trait_file, sheet = "Sheet 1")
+
+metabolite_ulttrait$ult_trait<-sub("(.)","\\U\\1",metabolite_ulttrait$ult_trait,perl=TRUE)
+
+setnames(metabolite_ulttrait,"exposure","outcome")
+
+all_res_HMDBID<-merge(all_res_HMDBID,metabolite_ulttrait,by="outcome")
+
+# Add sample size information
+catalog<-fread(catalog_file)
+catalog<-subset(catalog,catalog$firstAuthor=="Chen Y")
+catalog<-subset(catalog,catalog$pubmedId=="36635386")
+catalog$Ancestry<- sapply(catalog$discoverySampleAncestry,function(x){
+        temp <- strsplit(x, split = " ")[[1]][2]
+				return(as.character(temp))	
+				})
+catalog<-subset(catalog,catalog$Ancestry=="European")
+catalog$N<- sapply(catalog$discoverySampleAncestry,function(x){
+        temp <- strsplit(x, split = " ")[[1]][1]
+				return(as.numeric(temp))	
+				})
+catalog$outcome<- sapply(catalog$accessionId,function(x){
+        temp <- strsplit(x, split = "GCST")[[1]][2]
+				return(as.numeric(temp))	
+				})
+catalog<-catalog[,c("outcome","N")]
+
+all_res_HMDBID<-merge(all_res_HMDBID,catalog,by = "outcome")
+
+# Remove the temporary sample-size column
+all_res_HMDBID<-all_res_HMDBID[,-which(colnames(all_res_HMDBID) == "N")]
+
+# Sort by metabolite, sleep trait, and MR method
+# Initialize an empty result table
+all_res_ult<-data.frame(Method=NA,exposure=NA,reportedTrait=NA,outcome=NA,nsnp=NA,b=NA,se=NA,pval=NA,pfdr_method=NA,pfdr_sleepmethod=NA,pbof_method=NA,pbof_sleepmethod=NA,Q=NA,Q_df=NA,Q_pval=NA,intercept=NA,intercept_se=NA,intercept_pval=NA,id.exposure=NA,id.outcome=NA,exp_out_har_pair=NA,super_pathway=NA,sub_pathway=NA,gene_shared_protein=NA,protein_names=NA,har=NA,ult_trait=NA,HMDB_curated=NA)
+
+for (id in sort(unique(all_res$outcome))) {
+  temp<-subset(all_res_HMDBID,all_res_HMDBID$outcome==id)
+  for (sl in unique(all_res$exposure)) {
+    temp1<-subset(temp,temp$exposure==sl)
+    for (mt in unique(all_res$Method)) {
+      temp2<-subset(temp1,temp1$Method==mt)
+      
+      all_res_ult<-rbind(all_res_ult,temp2)
+    }
+  }
+}
+all_res_ult<-all_res_ult[-1,]
+
+# Calculate beta, OR, and 95% confidence intervals
+all_res_ult$BETA<-paste(round(all_res_ult$b,3),"(",round(all_res_ult$b-1.96*all_res_ult$se,3),"-",round(all_res_ult$b+1.96*all_res_ult$se,3),")",sep = "")
+
+all_res_ult$OR<-paste(round(exp(all_res_ult$b),3),"(",round(exp(all_res_ult$b-1.96*all_res_ult$se),3),"-",round(exp(all_res_ult$b+1.96*all_res_ult$se),3),")",sep = "")
+
+setnames(all_res_ult,c("BETA","OR"),c("Beta (95% CI)","OR (95% CI)"))
+
+write.xlsx(all_res_ult,file = file.path(mr_output_dir, "ult_har3_all_sleep_metabolite_mr_bindres_pathway_HMDBID_ulttrait.xlsx"))
+
+temp<-subset(all_res_ult,all_res_ult$Method=="Wald ratio")
+res_ult_sig<-subset(all_res_ult,all_res_ult$Method=="Inverse variance weighted")
+res_ult_sig<-subset(res_ult_sig,res_ult_sig$Q_pval>0.05)
+res_ult_sig<-rbind(res_ult_sig,temp)
+
+write.xlsx(subset(res_ult_sig,res_ult_sig$pfdr_method<0.05),file = file.path(mr_output_dir, "sleep_metabolite_primary_fdrmethod0.05.xlsx"))
+
+write.xlsx(subset(res_ult_sig,res_ult_sig$pfdr_sleepmethod<0.05),file = file.path(mr_output_dir, "sleep_metabolite_primary_fdrsleepmethod0.05.xlsx"))
+
+write.xlsx(subset(res_ult_sig,res_ult_sig$pbof_method!="/"),file = file.path(mr_output_dir, "sleep_metabolite_primary_bofmethod0.05.xlsx"))
+
+write.xlsx(subset(res_ult_sig,res_ult_sig$pbof_sleepmethod!="/"),file = file.path(mr_output_dir, "sleep_metabolite_primary_bofsleepmethod0.05.xlsx"))
+```
+
+## 5. Lipid sub-pathway enrichment among sleep-duration-associated metabolites
+
+Fisher exact tests compare lipids annotated to each sub-pathway with all other panel lipids, separately for sleep duration, long sleep duration, short sleep duration, and any sleep duration.
+
+**Chunk purpose.** Load the packages used by the Fisher tests.
+
+```{r mr-05-01-dependencies}
+# Source file: 5_Fisher_test_lipid_subpathway.R
+## 0. Dependencies
+pkgs <- c("readxl", "openxlsx", "ggplot2")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    stop(sprintf("Please install R package '%s' with install.packages('%s')", p, p))
+  }
+}
+suppressPackageStartupMessages({
+  library(readxl)
+  library(openxlsx)
+  library(ggplot2)
+})
+```
+
+**Chunk purpose.** Define input and output locations relative to the shared project root.
+
+```{r mr-05-02-path-configuration}
+# Source file: 5_Fisher_test_lipid_subpathway.R
+## 1. Path configuration
+base_dir <- mr_output_dir
+
+sig_file   <- file.path(reference_dir, "MR_Significant_MetaboliteSleep.xlsx")
+out_dir    <- file.path(base_dir, "Fisher's test")
+panel_file <- pathway_file
+allMR_file <- file.path(mr_output_dir, "ult_har3_all_metabolite_sleep_mr_bindres_pathway_HMDBID_ulttrait.xlsx")
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+if (!file.exists(sig_file))   stop("File not found: ", sig_file)
+if (!file.exists(panel_file)) stop("File not found: ", panel_file)
+```
+
+**Chunk purpose.** Normalize metabolite names before annotation matching.
+
+```{r mr-05-03-name-normalization}
+# Source file: 5_Fisher_test_lipid_subpathway.R
+## 2. Metabolite-name normalization
+norm_name <- function(x) {
+  x <- as.character(x)
+  x <- gsub("\\[.*?\\]", "", x)
+  x <- gsub("\\(.*?\\)", "", x)
+  x <- gsub("\\*", "", x)
+  x <- gsub("/", "to", x)         # /  ->  to
+  x <- gsub("-", "", x)
+  x <- gsub(" ", "", x)
+  tolower(x)
+}
+norm_lower <- function(x) tolower(trimws(as.character(x)))
+norm_loose <- function(x) gsub("[^a-z0-9]", "", tolower(as.character(x)))
+```
+
+**Chunk purpose.** Read the significant metabolite-sleep results.
+
+```{r mr-05-04-read-significant-results}
+# Source file: 5_Fisher_test_lipid_subpathway.R
+## 3. Read the significant MR results
+sig_raw <- as.data.frame(read_excel(sig_file, sheet = 1))
+sig_raw <- sig_raw[!is.na(sig_raw$Exposure), , drop = FALSE]
+
+need_cols <- c("Exposure", "Super pathway", "Sub pathway", "Outcome")
+miss <- setdiff(need_cols, colnames(sig_raw))
+if (length(miss) > 0) stop("The significant-results table is missing columns: ", paste(miss, collapse = ", "))
+sig <- sig_raw[, need_cols]
+colnames(sig) <- c("metabolite", "super_pathway", "sub_pathway", "outcome")
+sig$outcome <- trimws(sig$outcome)
+sig$key     <- norm_name(sig$metabolite)
+sig$low     <- norm_lower(sig$metabolite)
+sig$loose   <- norm_loose(sig$metabolite)
+```
+
+**Chunk purpose.** Read the full pathway annotation and define the lipid background set.
+
+```{r mr-05-05-read-pathway-annotation}
+# Source file: 5_Fisher_test_lipid_subpathway.R
+## 4. Read the panel pathway annotation (background set)
+panel <- as.data.frame(read_excel(panel_file, sheet = 1))
+colnames(panel)[1:5] <- c("metabolite", "super_pathway", "sub_pathway",
+                          "gene_shared_protein", "protein_names")
+
+panel$is_ratio <- grepl("/", panel$super_pathway, fixed = TRUE)
+panel$key      <- norm_name(panel$metabolite)
+panel$low      <- norm_lower(panel$metabolite)
+panel$loose    <- norm_loose(panel$metabolite)
+
+bg_all <- panel[!panel$is_ratio & !is.na(panel$sub_pathway) &
+                  panel$sub_pathway != "NA" & panel$super_pathway == "Lipid", ]
+# bg_all <- panel[!panel$is_ratio & !is.na(panel$sub_pathway) &
+#                   panel$sub_pathway != "NA", ]
+bg_all <- bg_all[, c("metabolite", "key", "low", "loose",
+                     "super_pathway", "sub_pathway")]
+rownames(bg_all) <- NULL
+
+cat("Background set: panel lipid metabolites =", nrow(bg_all), "; number of sub-pathways =",
+    length(unique(bg_all$sub_pathway)), "\n")
+cat("Significant-results table:", nrow(sig), " metabolite-sleep pairs; lipid pairs =",
+    sum(sig$super_pathway == "Lipid"), " pairs /",
+    length(unique(sig$metabolite[sig$super_pathway == "Lipid"])), " metabolites\n")
+```
+
+**Chunk purpose.** Map significant lipids to the background annotation with strict-to-loose name matching.
+
+```{r mr-05-06-map-metabolites}
+# Source file: 5_Fisher_test_lipid_subpathway.R
+## 5. Map significant metabolites to background lipid rows
+map_sig_to_bg <- function(sig_lipids, bg) {
+  idx <- integer(nrow(sig_lipids))
+  for (i in seq_len(nrow(sig_lipids))) {
+    lw <- sig_lipids$low[i]
+    ky <- sig_lipids$key[i]
+    sb <- sig_lipids$sub_pathway[i]
+
+    hit <- which(bg$low == lw)
+    if (length(hit) == 0) hit <- which(bg$key == ky)
+    if (length(hit) > 1) {
+      hit2 <- hit[bg$sub_pathway[hit] == sb]
+      if (length(hit2) >= 1) hit <- hit2
+    }
+    if (length(hit) == 0) {
+      warning("A significant metabolite was not found in the background annotation: ", sig_lipids$metabolite[i])
+      idx[i] <- NA_integer_
+    } else {
+      if (length(hit) > 1)
+        warning("A significant metabolite matched multiple background rows; the first was used: ",
+                sig_lipids$metabolite[i])
+      idx[i] <- hit[1]
+    }
+  }
+  idx
+}
+```
+
+**Chunk purpose.** Define sleep-duration outcomes, including their union.
+
+```{r mr-05-07-outcome-sets}
+# Source file: 5_Fisher_test_lipid_subpathway.R
+## 6. Define the four outcome sets
+outcome_defs <- list(
+  "Sleep duration"       = c("Sleep duration"),
+  "Long sleep duration"  = c("Long sleep duration"),
+  "Short sleep duration" = c("Short sleep duration"),
+  "Any sleep duration"   = c("Sleep duration", "Long sleep duration", "Short sleep duration")
+)
+```
+
+**Chunk purpose.** Build 2 x 2 tables and run one-sided and two-sided Fisher exact tests.
+
+```{r mr-05-08-fisher-function}
+# Source file: 5_Fisher_test_lipid_subpathway.R
+## 7. Core Fisher exact-test function
+# bg      : background data.frame (key / sub_pathway)
+run_fisher_lipid <- function(bg, is_sig, label) {
+
+  n_total <- nrow(bg)
+  n_sig   <- sum(is_sig)
+
+  subs <- sort(unique(bg$sub_pathway))
+
+  res <- lapply(subs, function(s) {
+    inS <- bg$sub_pathway == s
+    a  <- sum( inS &  is_sig)
+    b  <- sum( inS & !is_sig)
+    cc <- sum(!inS &  is_sig)
+    d  <- sum(!inS & !is_sig)
+
+    m <- matrix(c(a, b, cc, d), nrow = 2, byrow = TRUE,
+                dimnames = list(c("in_subpathway", "other_lipids"),
+                                c("associated", "not_associated")))
+
+    ft_g <- fisher.test(m, alternative = "greater")
+    ft_2 <- fisher.test(m, alternative = "two.sided", conf.int = TRUE)
+
+    exp_a <- (a + b) * (a + cc) / n_total
+
+    data.frame(
+      Outcome                    = label,
+      Sub_pathway                = s,
+      N_lipids_in_subpathway     = a + b,
+      a_Sig_in_subpathway        = a,
+      b_NonSig_in_subpathway     = b,
+      c_Sig_other_lipids         = cc,
+      d_NonSig_other_lipids      = d,
+      N_lipids_total             = n_total,
+      N_lipids_significant_total = n_sig,
+      Pct_sig_in_subpathway      = ifelse((a + b) > 0, 100 * a / (a + b), NA_real_),
+      Pct_sig_other_lipids       = ifelse((cc + d) > 0, 100 * cc / (cc + d), NA_real_),
+      Expected_a                 = exp_a,
+      Fold_enrichment            = ifelse(exp_a > 0, a / exp_a, NA_real_),
+      OR_sample                  = ifelse(b * cc > 0, (a * d) / (b * cc), NA_real_),
+      OR_conditional_MLE         = unname(ft_2$estimate),
+      OR_CI_low                  = unname(ft_2$conf.int[1]),
+      OR_CI_high                 = unname(ft_2$conf.int[2]),
+      P_one_sided_greater        = ft_g$p.value,
+      P_two_sided                = ft_2$p.value,
+      stringsAsFactors           = FALSE
+    )
+  })
+
+  out <- do.call(rbind, res)
+
+  out$FDR_BH <- p.adjust(out$P_one_sided_greater, method = "BH")
+  out$Holm   <- p.adjust(out$P_one_sided_greater, method = "holm")
+  out$FDR_significant_0.05 <- out$FDR_BH < 0.05
+  out$FDR_BH_two_sided      <- p.adjust(out$P_two_sided, method = "BH")
+  out$Holm_two_sided        <- p.adjust(out$P_two_sided, method = "holm")
+  out$FDR_two_sided_sig_0.05 <- out$FDR_BH_two_sided < 0.05
+
+  out <- out[order(out$P_one_sided_greater), ]
+  rownames(out) <- NULL
+  out
+}
+```
+
+**Chunk purpose.** Run Fisher tests for every outcome and show progress.
+
+```{r mr-05-09-run-tests}
+# Source file: 5_Fisher_test_lipid_subpathway.R
+## 8. Build 2 x 2 tables and run Fisher tests by outcome
+results_list  <- list()
+is_sig_list   <- list()
+subclass_cnt  <- list()
+
+for (nm in names(outcome_defs)) {
+  sl <- unique(sig[sig$super_pathway == "Lipid" & sig$outcome %in% outcome_defs[[nm]],
+                   c("metabolite", "key", "low", "sub_pathway")])
+
+  idx <- map_sig_to_bg(sl, bg_all)
+  sl  <- sl[!is.na(idx), , drop = FALSE]
+  idx <- idx[!is.na(idx)]
+
+  is_sig <- rep(FALSE, nrow(bg_all))
+  is_sig[idx] <- TRUE
+
+  chk <- data.frame(sub_pathway = bg_all$sub_pathway, sig = is_sig)
+  tab <- aggregate(sig ~ sub_pathway, data = chk, FUN = function(z) c(a = sum(z), n = length(z)))
+  a_col <- tab$sig[, "a"]; n_col <- tab$sig[, "n"]
+  if (any(a_col > n_col)) {
+    warning(nm, ": A sub-pathway has more significant metabolites than background metabolites; check the annotation.")
+  }
+
+  results_list[[nm]] <- run_fisher_lipid(bg_all, is_sig, nm)
+  is_sig_list[[nm]]  <- is_sig
+  subclass_cnt[[nm]] <- data.frame(Outcome = nm, Sub_pathway = tab$sub_pathway,
+                                   a = as.integer(a_col), N = as.integer(n_col),
+                                   b = as.integer(n_col - a_col),
+                                   stringsAsFactors = FALSE)
+
+  cat(sprintf("[Primary analysis] %-22s significant lipids = %3d / %3d\n", nm, sum(is_sig), nrow(bg_all)))
+}
+
+all_results <- do.call(rbind, results_list)
+rownames(all_results) <- NULL
+```
+
+**Chunk purpose.** Repeat the analysis with MR-testable lipids as a sensitivity background.
+
+```{r mr-05-10-sensitivity-analysis}
+# Source file: 5_Fisher_test_lipid_subpathway.R
+## 9. Sensitivity analysis using estimable lipids as background
+sens_results <- NULL
+if (file.exists(allMR_file)) {
+  mr_all    <- as.data.frame(read_excel(allMR_file, sheet = 1))
+  mr_names  <- unique(c(mr_all$reportedTrait, mr_all$ult_trait))
+  mr_key    <- unique(norm_name(mr_names))
+  mr_loose  <- unique(norm_loose(mr_names))
+  tested    <- bg_all$key %in% mr_key | bg_all$loose %in% mr_loose
+  bg_tested <- bg_all[tested, , drop = FALSE]
+  rownames(bg_tested) <- NULL
+
+  cat("\nSensitivity-analysis background: lipids with an MR estimate =", nrow(bg_tested), "\n")
+  sens_list <- list()
+  for (nm in names(outcome_defs)) {
+    sens_list[[nm]] <- run_fisher_lipid(bg_tested, is_sig_list[[nm]][tested],
+                                        paste0(nm, " [tested background]"))
+  }
+  sens_results <- do.call(rbind, sens_list)
+  rownames(sens_results) <- NULL
+}
+```
+
+**Chunk purpose.** Create overview, long, wide, contingency, and audit tables.
+
+```{r mr-05-11-summary-tables}
+# Source file: 5_Fisher_test_lipid_subpathway.R
+## 10. Summaries and wide tables
+overview <- do.call(rbind, lapply(names(results_list), function(nm) {
+  r <- results_list[[nm]]
+  data.frame(
+    Outcome                  = nm,
+    Background_lipids        = r$N_lipids_total[1],
+    Significant_lipids       = r$N_lipids_significant_total[1],
+    Sub_pathways_tested      = nrow(r),
+    Sub_pathways_FDR_lt_0.05 = sum(r$FDR_significant_0.05),
+    Top_sub_pathway          = r$Sub_pathway[1],
+    Top_P_one_sided          = signif(r$P_one_sided_greater[1], 3),
+    Top_FDR_BH               = signif(r$FDR_BH[1], 3),
+    Top_OR_conditional_MLE   = signif(r$OR_conditional_MLE[1], 3),
+    stringsAsFactors         = FALSE
+  )
+}))
+
+wide_or  <- reshape(all_results[, c("Sub_pathway", "Outcome", "OR_conditional_MLE")],
+                    idvar = "Sub_pathway", timevar = "Outcome", direction = "wide")
+wide_p   <- reshape(all_results[, c("Sub_pathway", "Outcome", "P_one_sided_greater")],
+                    idvar = "Sub_pathway", timevar = "Outcome", direction = "wide")
+wide_fdr <- reshape(all_results[, c("Sub_pathway", "Outcome", "FDR_BH")],
+                    idvar = "Sub_pathway", timevar = "Outcome", direction = "wide")
+colnames(wide_or)  <- gsub("^OR_conditional_MLE\\.", "OR: ",  colnames(wide_or))
+colnames(wide_p)   <- gsub("^P_one_sided_greater\\.",  "P: ",   colnames(wide_p))
+colnames(wide_fdr) <- gsub("^FDR_BH\\.",               "FDR: ", colnames(wide_fdr))
+wide_tab <- cbind(wide_or, wide_p[, -1, drop = FALSE], wide_fdr[, -1, drop = FALSE])
+wide_tab <- wide_tab[, c("Sub_pathway",
+                         grep("^OR: ",  colnames(wide_tab), value = TRUE),
+                         grep("^P: ",   colnames(wide_tab), value = TRUE),
+                         grep("^FDR: ", colnames(wide_tab), value = TRUE))]
+
+contingency <- do.call(rbind, lapply(names(results_list), function(nm) {
+  r <- results_list[[nm]]
+  data.frame(Outcome            = nm,
+             Sub_pathway        = r$Sub_pathway,
+             a_Sig_in           = r$a_Sig_in_subpathway,
+             b_NonSig_in        = r$b_NonSig_in_subpathway,
+             c_Sig_out          = r$c_Sig_other_lipids,
+             d_NonSig_out       = r$d_NonSig_other_lipids,
+             OR_sample          = r$OR_sample,
+             P_one_sided_greater = r$P_one_sided_greater,
+             FDR_BH             = r$FDR_BH,
+             stringsAsFactors   = FALSE)
+}))
+rownames(contingency) <- NULL
+
+sig_members <- do.call(rbind, lapply(names(outcome_defs), function(nm) {
+  sl <- unique(sig[sig$super_pathway == "Lipid" & sig$outcome %in% outcome_defs[[nm]],
+                   c("metabolite", "sub_pathway")])
+  data.frame(Outcome = nm, Sub_pathway = sl$sub_pathway, Metabolite = sl$metabolite,
+             stringsAsFactors = FALSE)
+}))
+rownames(sig_members) <- NULL
+
+cell_members <- do.call(rbind, lapply(names(results_list), function(nm) {
+  is_sig <- is_sig_list[[nm]]
+  r <- results_list[[nm]]
+  out <- do.call(rbind, lapply(r$Sub_pathway, function(s) {
+    inS <- bg_all$sub_pathway == s
+    data.frame(
+      Outcome     = nm,
+      Sub_pathway = s,
+      Cell        = c("a: in subclass, associated",
+                      "b: in subclass, not associated"),
+      n           = c(sum( inS &  is_sig), sum( inS & !is_sig)),
+      Metabolite  = c(paste(bg_all$metabolite[ inS &  is_sig], collapse = "; "),
+                      paste(bg_all$metabolite[ inS & !is_sig], collapse = "; ")),
+      stringsAsFactors = FALSE
+    )
+  }))
+  out
+}))
+rownames(cell_members) <- NULL
+```
+
+**Chunk purpose.** Write per-outcome CSV files and the formatted Excel workbook.
+
+```{r mr-05-12-write-results}
+# Source file: 5_Fisher_test_lipid_subpathway.R
+## 11. Output
+for (nm in names(results_list)) {
+  fn <- file.path(out_dir, sprintf("Fisher_lipid_subpathway_results_%s.csv",
+                                   gsub("[^A-Za-z]+", "_", nm)))
+  write.csv(results_list[[nm]], fn, row.names = FALSE, fileEncoding = "UTF-8")
+}
+
+wb_list <- c(list("0_Overview"         = overview,
+                  "All results (long)" = all_results,
+                  "Contingency tables" = contingency,
+                  "Cell a-b members"   = cell_members,
+                  "Wide OR-P-FDR"      = wide_tab,
+                  "Significant lipids" = sig_members),
+             results_list)
+if (!is.null(sens_results)) wb_list[["Sensitivity (tested bg)"]] <- sens_results
+
+wb <- createWorkbook()
+for (sn in names(wb_list)) {
+  addWorksheet(wb, sn)
+  writeData(wb, sn, wb_list[[sn]])
+  freezePane(wb, sn, firstRow = TRUE)
+  setColWidths(wb, sn, cols = seq_len(ncol(wb_list[[sn]])), widths = "auto")
+}
+
+notes <- data.frame(Note = c(
+  "Fisher's exact test for enrichment of lipid sub-pathways among sleep-duration-associated metabolites",
+  "2 x 2 table: rows = [lipids annotated to the sub-pathway, all other lipids]; columns = [associated with the sleep-duration trait, not associated]",
+  "a = sub-pathway lipids associated; b = sub-pathway lipids not associated; c = other lipids associated; d = other lipids not associated",
+  "P_one_sided_greater = Fisher's exact test with alternative = 'greater' (enrichment test); P_two_sided = two-sided Fisher's exact test",
+  "OR_conditional_MLE / OR_CI_low / OR_CI_high = conditional maximum-likelihood odds ratio and exact 95% CI from fisher.test",
+  "OR_sample = crude odds ratio (a*d)/(b*c)",
+  "FDR_BH / Holm = BH-FDR and Holm correction based on the ONE-SIDED p-value (P_one_sided_greater) across all lipid sub-pathways within each outcome; this is the primary result",
+  "FDR_BH_two_sided / Holm_two_sided = the same corrections applied to the TWO-SIDED p-value (provided for comparison / sensitivity)",
+  paste0("Background (main analysis) = all ", nrow(bg_all),
+         " single lipid metabolites of the Metabolon panel (super pathway = Lipid); metabolite ratios (A/B) excluded; each lipid counted once"),
+  "Background (sensitivity analysis) = only lipids for which an MR estimate was available",
+  "Significant metabolite-sleep pairs were taken from MR_Significant_MetaboliteSleep.xlsx (PFDR < 0.05, primary IVW analysis, correct causal direction)",
+  "'Any sleep duration' = union of Sleep duration, Long sleep duration and Short sleep duration",
+  "Method: Fisher exact tests for lipid sub-pathway enrichment"
+))
+addWorksheet(wb, "Methods")
+writeData(wb, "Methods", notes)
+setColWidths(wb, "Methods", cols = 1, widths = 160)
+
+can_write <- function(p) {
+  if (!file.exists(p)) return(TRUE)
+  con <- try(file(p, "r+b"), silent = TRUE)
+  if (inherits(con, "try-error")) return(FALSE)
+  close(con); TRUE
+}
+
+xlsx_out <- file.path(out_dir, "Fisher_lipid_subpathway_results.xlsx")
+if (!can_write(xlsx_out)) {
+  xlsx_out <- file.path(out_dir,
+    format(Sys.time(), "Fisher_lipid_subpathway_results_%H%M%S.xlsx"))
+  cat("\nNote: the target xlsx is locked by another program (usually Excel); output was written to: ", xlsx_out, "\n")
+}
+saveWorkbook(wb, xlsx_out, overwrite = TRUE)
+cat("\nWritten: ", xlsx_out, "\n")
+```
